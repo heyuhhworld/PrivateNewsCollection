@@ -1,10 +1,9 @@
 /**
- * 开发环境免登录（注入本地开发用户）：默认关闭，须显式开启。
- * - 设置 DEV_ALLOW_AUTH_BYPASS=1 或 true 时启用（仅 NODE_ENV=development）
+ * 临时免登录（注入本地开发用户）：默认关闭，须显式开启。
+ * - 设置 DEV_ALLOW_AUTH_BYPASS=1 或 true 时启用（开发/生产均可，用于内网临时放开）
  * - 设置 DEV_REQUIRE_AUTH=1 或 true 时强制关闭（兼容旧 .env）
  */
 export const devAuthBypass =
-  process.env.NODE_ENV === "development" &&
   process.env.DEV_REQUIRE_AUTH !== "1" &&
   process.env.DEV_REQUIRE_AUTH !== "true" &&
   (process.env.DEV_ALLOW_AUTH_BYPASS === "1" ||
@@ -16,6 +15,8 @@ export const ENV = {
   databaseUrl: process.env.DATABASE_URL ?? "",
   oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
   ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
+  /** 与邮箱登录 openId 规则一致（小写）；与 OWNER_OPEN_ID 二选一或同时配置均可 */
+  ownerEmail: process.env.OWNER_EMAIL?.trim().toLowerCase() ?? "",
   isProduction: process.env.NODE_ENV === "production",
   /** LLM 基址（不含路径）；代码会拼接 `/v1/chat/completions`。可与 OPENAI_BASE_URL 二选一 */
   forgeApiUrl:

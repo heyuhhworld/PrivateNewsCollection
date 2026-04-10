@@ -44,6 +44,7 @@ export async function getDevBypassUser(): Promise<User> {
     openId: LOCAL_DEV_OPEN_ID,
     name: "本地开发者",
     email: "dev@localhost",
+    passwordHash: null,
     loginMethod: "dev",
     role: "admin",
     createdAt: now,

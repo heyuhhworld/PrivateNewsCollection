@@ -24,6 +24,7 @@ function isSecureRequest(req: Request) {
 export function getSessionCookieOptions(
   req: Request
 ): Pick<CookieOptions, "domain" | "httpOnly" | "path" | "sameSite" | "secure"> {
+  const secure = isSecureRequest(req);
   // const hostname = req.hostname;
   // const shouldSetDomain =
   //   hostname &&
@@ -42,7 +43,8 @@ export function getSessionCookieOptions(
   return {
     httpOnly: true,
     path: "/",
-    sameSite: "none",
-    secure: isSecureRequest(req),
+    // HTTP 场景（本地/内网）不能使用 SameSite=None，否则浏览器会拒收该 Cookie
+    sameSite: secure ? "none" : "lax",
+    secure,
   };
 }

@@ -181,6 +181,7 @@ export default function SystemManagement() {
   const [expandedLogs, setExpandedLogs] = useState<number | null>(null);
   const [form, setForm] = useState<JobFormData>(DEFAULT_FORM);
   const [runningJobId, setRunningJobId] = useState<number | null>(null);
+  const [refreshingJobs, setRefreshingJobs] = useState(false);
   /** 编辑任务时勾选则清除已保存的 Preqin 密码 */
   const [clearPreqinPassword, setClearPreqinPassword] = useState(false);
   // Manual import state
@@ -199,6 +200,19 @@ export default function SystemManagement() {
     { jobId: expandedLogs ?? undefined },
     { enabled: expandedLogs !== null }
   );
+
+  useEffect(() => {
+    if (!jobs || jobs.length === 0) {
+      setRunningJobId(null);
+      return;
+    }
+    const running = jobs.find((j: any) => j.lastRunStatus === "running");
+    if (running) {
+      setRunningJobId(running.id);
+      return;
+    }
+    setRunningJobId(null);
+  }, [jobs]);
 
   const createMutation = trpc.crawl.create.useMutation({
     onSuccess: () => {
@@ -242,6 +256,19 @@ export default function SystemManagement() {
       setRunningJobId(null);
     },
   });
+  const stopRunMutation = trpc.crawl.stopRun.useMutation({
+    onSuccess: (data) => {
+      if (data.success) {
+        toast.success(data.message);
+      } else {
+        toast.message(data.message);
+      }
+      refetch();
+      if (expandedLogs !== null) refetchLogs();
+    },
+    onError: (e) => toast.error(`停止失败: ${e.message}`),
+  });
+  const reconcileRunningLogsMutation = trpc.crawl.reconcileRunningLogs.useMutation();
 
   const toggleEnabledMutation = trpc.crawl.update.useMutation({
     onSuccess: () => refetch(),
@@ -573,6 +600,28 @@ export default function SystemManagement() {
     runNowMutation.mutate({ id: jobId });
   }
 
+  function handleStopRun(jobId: number) {
+    stopRunMutation.mutate({ id: jobId });
+  }
+
+  async function handleRefreshJobs() {
+    setRefreshingJobs(true);
+    try {
+      const out = await reconcileRunningLogsMutation.mutateAsync({});
+      await refetch();
+      if (expandedLogs !== null) await refetchLogs();
+      if (out.updated > 0) {
+        toast.success(out.message);
+      } else {
+        toast.message("已刷新任务与日志");
+      }
+    } catch (e: any) {
+      toast.error(`刷新失败: ${e?.message ?? e}`);
+    } finally {
+      setRefreshingJobs(false);
+    }
+  }
+
   return (
     <div className="flex flex-col h-full bg-[#f5f7fa]">
       {/* Header */}
@@ -584,8 +633,15 @@ export default function SystemManagement() {
         <div className="flex items-center gap-2">
           {activeTab === "jobs" ? (
             <>
-              <Button variant="outline" size="sm" onClick={() => refetch()} className="h-8 gap-1.5 text-xs">
-                <RefreshCw className="h-3.5 w-3.5" />刷新
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleRefreshJobs()}
+                disabled={refreshingJobs}
+                className="h-8 gap-1.5 text-xs"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${refreshingJobs ? "animate-spin" : ""}`} />
+                刷新
               </Button>
               <Button
                 size="sm"
@@ -1070,20 +1126,37 @@ export default function SystemManagement() {
                           )}
                           日志
                         </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 px-2 text-xs gap-1 text-gray-500 hover:text-green-600"
-                          onClick={() => handleRunNow(job.id)}
-                          disabled={runningJobId === job.id}
-                        >
-                          {runningJobId === job.id ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            <Play className="h-3.5 w-3.5" />
-                          )}
-                          立即执行
-                        </Button>
+                        {runningJobId === job.id ? (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 px-2 text-xs gap-1 text-red-600 hover:text-red-700"
+                            onClick={() => handleStopRun(job.id)}
+                            disabled={stopRunMutation.isPending}
+                          >
+                            {stopRunMutation.isPending ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Square className="h-3.5 w-3.5" />
+                            )}
+                            停止
+                          </Button>
+                        ) : (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 px-2 text-xs gap-1 text-gray-500 hover:text-green-600"
+                            onClick={() => handleRunNow(job.id)}
+                            disabled={runNowMutation.isPending}
+                          >
+                            {runNowMutation.isPending ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Play className="h-3.5 w-3.5" />
+                            )}
+                            立即执行
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1186,8 +1259,8 @@ export default function SystemManagement() {
               <div>
                 <p className="text-sm font-medium text-blue-700 mb-1">关于定时任务</p>
                 <p className="text-xs text-blue-600 leading-relaxed">
-                  每个任务对应一个资讯列表页（如 pitchbook.com/news）。点击"立即执行"时，系统将自动打开该页面并提取所有文章链接，再逐篇调用 AI 生成中文摘要后入库（每次最多 20 篇）。
-                  执行日志中可查看"发现 N 篇 / 导入 N 篇"的详细结果。
+                  每个任务对应一个资讯列表页（如 pitchbook.com/news）。点击"立即执行"时，系统会先提取链接并按任务的时间区间过滤，再按队列单线程逐篇导入；
+                  每导入 1 篇会等待 30 秒后处理下一篇。执行日志可查看“发现 N 篇 / 符合 N 篇 / 导入 N 篇”的进度结果。
                 </p>
               </div>
             </div>

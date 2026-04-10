@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { eq } from "drizzle-orm";
 import {
   decryptCredential,
   encryptCredential,
@@ -17,6 +18,8 @@ import {
   updateCrawlLog,
 } from "../db";
 import { importSingleArticle } from "./news";
+import { getDb } from "../db";
+import { newsArticles } from "../../drizzle/schema";
 
 function cookiesToHeader(
   cookies: { name: string; value: string; domain?: string }[]
@@ -37,15 +40,15 @@ async function tryPreqinLogin(
   await page.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(2500);
 
-  async function fillVisibleLoginForm(): Promise<boolean> {
-    const pwLoc = page.locator('input[type="password"]');
+  async function tryFillAndSubmitInScope(scope: any): Promise<boolean> {
+    const pwLoc = scope.locator('input[type="password"]');
     const n = await pwLoc.count();
     if (n === 0) return false;
     const first = pwLoc.first();
     const vis = await first.isVisible().catch(() => false);
     if (!vis) return false;
 
-    const emailLoc = page
+    const emailLoc = scope
       .locator(
         'input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"], input[id*="email" i], input[name="Email"]'
       )
@@ -53,12 +56,12 @@ async function tryPreqinLogin(
     if ((await emailLoc.count()) > 0) {
       await emailLoc.fill(username);
     } else {
-      const txt = page.locator("input[type=text]").first();
+      const txt = scope.locator("input[type=text]").first();
       if ((await txt.count()) > 0) await txt.fill(username);
     }
     await first.fill(password);
 
-    const submit = page
+    const submit = scope
       .locator(
         'button[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Continue"), input[type="submit"]'
       )
@@ -66,8 +69,38 @@ async function tryPreqinLogin(
     await submit.click().catch(async () => {
       await page.keyboard.press("Enter");
     });
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(6000);
     return true;
+  }
+
+  async function openLoginEntryIfExists(): Promise<void> {
+    const trigger = page
+      .locator(
+        'a:has-text("Sign in"), a:has-text("Log in"), button:has-text("Sign in"), button:has-text("Log in"), [data-testid*="login" i], [href*="login" i]'
+      )
+      .first();
+    const c = await trigger.count();
+    if (c > 0) {
+      await trigger.click().catch(() => {});
+      await page.waitForTimeout(2000);
+    }
+  }
+
+  async function fillVisibleLoginForm(): Promise<boolean> {
+    await openLoginEntryIfExists();
+    if (await tryFillAndSubmitInScope(page)) return true;
+
+    // 某些站点登录表单在 iframe（如 Auth0 嵌入）里
+    const frames = page.frames();
+    for (const fr of frames) {
+      if (fr === page.mainFrame()) continue;
+      try {
+        if (await tryFillAndSubmitInScope(fr)) return true;
+      } catch {
+        // ignore frame and continue
+      }
+    }
+    return false;
   }
 
   let ok = await fillVisibleLoginForm();
@@ -95,7 +128,113 @@ async function tryPreqinLogin(
 
 // ─── Playwright browser helper ─────────────────────────────────────────────
 
-type ExtractResult = { links: string[]; cookieHeader?: string };
+type LinkCandidate = { url: string; publishedAt?: string };
+type ExtractResult = { candidates: LinkCandidate[]; cookieHeader?: string };
+type RunningJobState = { cancelRequested: boolean; logId: number | null };
+const runningJobs = new Map<number, RunningJobState>();
+const IMPORT_DELAY_MS = 30_000;
+const MAX_IMPORT_PER_RUN = 5;
+
+function normalizeUrlForDedup(url: string): string {
+  try {
+    const u = new URL(url);
+    // 去掉 hash；保留 query 供必要页面识别，但去掉末尾斜杠
+    u.hash = "";
+    const p = u.pathname.replace(/\/+$/, "");
+    return `${u.origin}${p}${u.search}`;
+  } catch {
+    return url;
+  }
+}
+
+function parsePublishedAtFromText(text: string): string | undefined {
+  if (!text) return undefined;
+  const normalized = text.replace(/\s+/g, " ").trim();
+  // e.g. "Apr 1, 2026" / "April 1, 2026"
+  const monthFirst = normalized.match(
+    /\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}\b/i
+  );
+  if (monthFirst) {
+    const d = new Date(monthFirst[0]);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+  }
+  // e.g. "1 Apr 2026"
+  const dayFirst = normalized.match(
+    /\b\d{1,2}\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}\b/i
+  );
+  if (dayFirst) {
+    const d = new Date(dayFirst[0]);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+  }
+  return undefined;
+}
+
+async function delayWithCancelCheck(
+  ms: number,
+  shouldStop: () => boolean
+): Promise<void> {
+  const step = 1000;
+  let left = ms;
+  while (left > 0) {
+    if (shouldStop()) throw new Error("任务已手动停止");
+    const chunk = Math.min(step, left);
+    await new Promise((r) => setTimeout(r, chunk));
+    left -= chunk;
+  }
+}
+
+/** 仅保留可导入的“具体文章页”链接，避免把列表页写入 originalUrl */
+function isConcreteArticleUrl(
+  url: string,
+  source: "Preqin" | "Pitchbook",
+  listingUrl: string
+): boolean {
+  try {
+    const u = new URL(url);
+    const listing = new URL(listingUrl);
+    const path = u.pathname.replace(/\/+$/, "");
+    const listingPath = listing.pathname.replace(/\/+$/, "");
+
+    // 过滤明显非内容页
+    if (!/^https?:$/i.test(u.protocol)) return false;
+    if (
+      path === "" ||
+      path === "/" ||
+      path.startsWith("/search") ||
+      path.includes("/login") ||
+      path.includes("/account")
+    ) {
+      return false;
+    }
+
+    if (source === "Pitchbook") {
+      return (
+        path.includes("/news/articles/") ||
+        path.includes("/news/reports/")
+      );
+    }
+
+    // Preqin:
+    // 列表页常见：/insights/research?...
+    // 文章页通常：/insights/research/<slug>（至少比列表页多一级）
+    if (!(path.includes("/insights/") || path.includes("/research/"))) {
+      return false;
+    }
+    if (u.host !== listing.host) return false;
+    if (path === listingPath) return false;
+    if (u.search && path === listingPath) return false;
+    if (path.startsWith("/insights/research") && !path.startsWith("/insights/research/")) {
+      return false;
+    }
+
+    const segs = path.split("/").filter(Boolean);
+    // 至少 3 段：insights / research / slug
+    if (segs.length < 3) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Use Playwright (headless Chromium) to load a listing page and extract
@@ -113,7 +252,7 @@ async function extractArticleLinksWithBrowser(
     chromium = pw.chromium;
   } catch {
     console.error("[Crawl] playwright not available");
-    return { links: [] };
+    return { candidates: [] };
   }
 
   try {
@@ -148,29 +287,52 @@ async function extractArticleLinksWithBrowser(
       await page.waitForTimeout(6000);
     }
 
-    const links: string[] = await page.evaluate((src: string) => {
+    const rawEntries: Array<{ href: string; context: string }> = await page.evaluate(
+      (src: string) => {
       const anchors = Array.from(
         document.querySelectorAll("a[href]")
       ) as HTMLAnchorElement[];
-      const hrefs = anchors.map((a) => a.href);
+      const hrefs = anchors.map((a) => {
+        const ctx =
+          (a.closest("article, li, .card, .tile, .result, .news, .insight, div")
+            ?.textContent ?? a.textContent ?? "")
+            .slice(0, 400)
+            .trim();
+        return { href: a.href, context: ctx };
+      });
 
       if (src === "Pitchbook") {
         return hrefs
           .filter(
             (h) =>
-              h.includes("pitchbook.com/news/articles/") ||
-              h.includes("pitchbook.com/news/reports/")
+              h.href.includes("pitchbook.com/news/articles/") ||
+              h.href.includes("pitchbook.com/news/reports/")
           )
-          .filter((v, i, arr) => arr.indexOf(v) === i);
+          .filter((v, i, arr) => arr.findIndex((x) => x.href === v.href) === i);
       }
       return hrefs
         .filter(
           (h) =>
-            h.includes("preqin.com/insights/") ||
-            h.includes("preqin.com/research/")
+            h.href.includes("preqin.com/insights/") ||
+            h.href.includes("preqin.com/research/")
         )
-        .filter((v, i, arr) => arr.indexOf(v) === i);
+        .filter((v, i, arr) => arr.findIndex((x) => x.href === v.href) === i);
     }, source);
+
+    const candidates = rawEntries
+      .map((e) => ({
+        url: normalizeUrlForDedup(e.href),
+        publishedAt: parsePublishedAtFromText(e.context),
+      }))
+      .filter(
+        (e, i, arr) =>
+          arr.findIndex((x) => x.url === e.url) === i &&
+          isConcreteArticleUrl(
+            e.url,
+            source as "Preqin" | "Pitchbook",
+            listingUrl
+          )
+      );
 
     let cookieHeader: string | undefined;
     if (source === "Preqin" && auth?.username) {
@@ -182,9 +344,11 @@ async function extractArticleLinksWithBrowser(
       }
     }
 
-    console.log(`[Crawl] Found ${links.length} article links from ${listingUrl}`);
+    console.log(
+      `[Crawl] Found ${candidates.length} candidate links from ${listingUrl}`
+    );
     await browser.close();
-    return { links, cookieHeader };
+    return { candidates, cookieHeader };
   } catch (err: any) {
     console.error(`[Crawl] Browser extraction failed: ${err?.message}`);
     if (browser) {
@@ -194,7 +358,7 @@ async function extractArticleLinksWithBrowser(
         /* ignore */
       }
     }
-    return { links: [] };
+    return { candidates: [] };
   }
 }
 
@@ -296,6 +460,59 @@ export const crawlRouter = router({
       return { success: true };
     }),
 
+  /** 停止正在执行中的任务（协作式中止：当前文章处理完后立即停止后续导入） */
+  stopRun: publicProcedure
+    .input(z.object({ id: z.number().int() }))
+    .mutation(async ({ input }) => {
+      const state = runningJobs.get(input.id);
+      if (!state) {
+        // 兜底：若服务重启导致内存态丢失，但日志仍是 running，则执行强制收口
+        const logs = await getCrawlLogs(input.id);
+        const runningLog = logs.find((l) => l.status === "running");
+        if (!runningLog) {
+          return { success: false, message: "任务当前未在执行" };
+        }
+        await updateCrawlLog(runningLog.id, {
+          status: "failed",
+          message: "任务已手动停止（强制收口）",
+          finishedAt: new Date(),
+        });
+        await updateCrawlJob(input.id, { lastRunStatus: "failed" });
+        return { success: true, message: "已强制停止并结束执行日志" };
+      }
+      state.cancelRequested = true;
+      runningJobs.set(input.id, state);
+      if (state.logId) {
+        await updateCrawlLog(state.logId, {
+          message: "收到停止请求，正在安全停止...",
+        });
+      }
+      return { success: true, message: "已发送停止请求" };
+    }),
+
+  /** 刷新时清理僵尸 running 日志（进程已不在执行但日志仍是 running） */
+  reconcileRunningLogs: publicProcedure
+    .input(z.object({ jobId: z.number().int().optional() }).optional())
+    .mutation(async ({ input }) => {
+      const logs = await getCrawlLogs(input?.jobId);
+      const zombies = logs.filter(
+        (l) => l.status === "running" && !runningJobs.has(l.jobId)
+      );
+      if (zombies.length === 0) {
+        return { updated: 0, message: "无僵尸执行日志" };
+      }
+
+      for (const l of zombies) {
+        await updateCrawlLog(l.id, {
+          status: "failed",
+          message: "任务已终止（刷新时自动收口）",
+          finishedAt: new Date(),
+        });
+        await updateCrawlJob(l.jobId, { lastRunStatus: "failed" });
+      }
+      return { updated: zombies.length, message: `已收口 ${zombies.length} 条执行中日志` };
+    }),
+
   /**
    * runNow: 
    * 1. Use Playwright to load the listing page URL and extract article links
@@ -307,6 +524,9 @@ export const crawlRouter = router({
     .mutation(async ({ input }) => {
       const job = await getCrawlJobById(input.id);
       if (!job) throw new Error("任务不存在");
+      if (runningJobs.has(job.id)) {
+        throw new Error("该任务正在执行中，请勿重复触发");
+      }
 
       // Create log entry
       const log = await createCrawlLog({
@@ -319,9 +539,18 @@ export const crawlRouter = router({
         finishedAt: null,
       });
 
-      await updateCrawlJob(job.id, { lastRunAt: new Date() });
+      runningJobs.set(job.id, { cancelRequested: false, logId: log?.id ?? null });
+      await updateCrawlJob(job.id, { lastRunAt: new Date(), lastRunStatus: "running" });
 
       try {
+        const shouldStop = () => Boolean(runningJobs.get(job.id)?.cancelRequested);
+        const ensureNotStopped = () => {
+          if (shouldStop()) {
+            throw new Error("任务已手动停止");
+          }
+        };
+
+        ensureNotStopped();
         let preqinAuth: { username: string; password: string } | null = null;
         if (
           job.source === "Preqin" &&
@@ -338,14 +567,15 @@ export const crawlRouter = router({
           }
         }
 
-        const { links: articleLinks, cookieHeader } =
+        const { candidates, cookieHeader } =
           await extractArticleLinksWithBrowser(
             job.url,
             job.source as "Preqin" | "Pitchbook",
             preqinAuth
           );
+        ensureNotStopped();
 
-        if (articleLinks.length === 0) {
+        if (candidates.length === 0) {
           const msg = "未能从列表页提取到文章链接，请检查 URL 是否为有效的资讯列表页";
           if (log) {
             await updateCrawlLog(log.id, {
@@ -360,17 +590,63 @@ export const crawlRouter = router({
           throw new Error(msg);
         }
 
-        // Update log with found count
+        // 按任务配置的抓取时间区间过滤（优先使用列表提取到的发布日期）
+        const now = Date.now();
+        const cutoffMs = now - Math.max(1, job.rangeInDays || 1) * 24 * 3600 * 1000;
+        const inRangeCandidates = candidates.filter((c) => {
+          // 严格时间过滤：拿不到发布日期时不入队，避免混入历史文章
+          if (!c.publishedAt) return false;
+          const t = new Date(c.publishedAt).getTime();
+          if (Number.isNaN(t)) return false;
+          return t >= cutoffMs;
+        });
+
+        if (inRangeCandidates.length === 0) {
+          const msg = `已提取 ${candidates.length} 篇链接，但无符合近 ${job.rangeInDays} 天范围的文章`;
+          if (log) {
+            await updateCrawlLog(log.id, {
+              status: "success",
+              articlesFound: candidates.length,
+              articlesAdded: 0,
+              message: msg,
+              finishedAt: new Date(),
+            });
+          }
+          await updateCrawlJob(job.id, { lastRunStatus: "success" });
+          return {
+            success: true,
+            articlesFound: candidates.length,
+            articlesAdded: 0,
+            message: msg,
+          };
+        }
+
+        // Update log with found/queued count
         if (log) {
           await updateCrawlLog(log.id, {
-            articlesFound: articleLinks.length,
-            message: `发现 ${articleLinks.length} 篇文章，正在逐篇导入...`,
+            articlesFound: candidates.length,
+            message: `发现 ${candidates.length} 篇，符合近 ${job.rangeInDays} 天 ${inRangeCandidates.length} 篇，已加入导入队列（单线程）`,
           });
         }
 
-        // Step 2: Import each article (limit to first 20 to avoid timeout)
-        const limit = Math.min(articleLinks.length, 20);
-        const linksToProcess = articleLinks.slice(0, limit);
+        // Step 2: 单线程逐条导入；每篇完成后停 30s 再处理下一篇
+        const db = await getDb();
+        let dedupedQueue = inRangeCandidates.map((c) => c.url);
+        if (db) {
+          const deduped: string[] = [];
+          for (const u of dedupedQueue) {
+            const existing = await db
+              .select({ id: newsArticles.id })
+              .from(newsArticles)
+              .where(eq(newsArticles.originalUrl, u))
+              .limit(1);
+            if (existing.length === 0) deduped.push(u);
+          }
+          dedupedQueue = deduped;
+        }
+
+        const linksToProcess = dedupedQueue.slice(0, MAX_IMPORT_PER_RUN);
+        const limit = linksToProcess.length;
 
         let successCount = 0;
         let duplicateCount = 0;
@@ -381,7 +657,9 @@ export const crawlRouter = router({
             ? { cookieHeader }
             : undefined;
 
-        for (const articleUrl of linksToProcess) {
+        for (let i = 0; i < linksToProcess.length; i++) {
+          const articleUrl = linksToProcess[i];
+          ensureNotStopped();
           const result = await importSingleArticle(
             articleUrl,
             job.source as "Preqin" | "Pitchbook",
@@ -390,14 +668,26 @@ export const crawlRouter = router({
           if (result.status === "success") successCount++;
           else if (result.status === "duplicate") duplicateCount++;
           else failedCount++;
+
+          if (log) {
+            await updateCrawlLog(log.id, {
+              message:
+                i < linksToProcess.length - 1
+                  ? `队列进度 ${i + 1}/${linksToProcess.length}，成功 ${successCount}，重复 ${duplicateCount}，失败 ${failedCount}。等待 30s 后抓取下一篇...`
+                  : `队列进度 ${i + 1}/${linksToProcess.length}，成功 ${successCount}，重复 ${duplicateCount}，失败 ${failedCount}`,
+            });
+          }
+          if (i < linksToProcess.length - 1) {
+            await delayWithCancelCheck(IMPORT_DELAY_MS, shouldStop);
+          }
         }
 
-        const message = `发现 ${articleLinks.length} 篇，处理 ${limit} 篇：成功导入 ${successCount} 篇，已存在 ${duplicateCount} 篇，失败 ${failedCount} 篇`;
+        const message = `发现 ${candidates.length} 篇，符合近 ${job.rangeInDays} 天 ${inRangeCandidates.length} 篇，去重后待处理 ${dedupedQueue.length} 篇，本次最多抓取 ${MAX_IMPORT_PER_RUN} 篇，实际处理 ${limit} 篇：成功导入 ${successCount} 篇，已存在 ${duplicateCount} 篇，失败 ${failedCount} 篇`;
 
         if (log) {
           await updateCrawlLog(log.id, {
             status: failedCount === limit ? "failed" : "success",
-            articlesFound: articleLinks.length,
+            articlesFound: candidates.length,
             articlesAdded: successCount,
             message,
             finishedAt: new Date(),
@@ -410,12 +700,13 @@ export const crawlRouter = router({
 
         return {
           success: true,
-          articlesFound: articleLinks.length,
+          articlesFound: candidates.length,
           articlesAdded: successCount,
           message,
         };
       } catch (err: any) {
         const errMsg = err?.message ?? "未知错误";
+        const stopped = errMsg.includes("手动停止");
         if (log) {
           await updateCrawlLog(log.id, {
             status: "failed",
@@ -424,7 +715,9 @@ export const crawlRouter = router({
           });
         }
         await updateCrawlJob(job.id, { lastRunStatus: "failed" });
-        throw new Error(`执行失败: ${errMsg}`);
+        throw new Error(stopped ? errMsg : `执行失败: ${errMsg}`);
+      } finally {
+        runningJobs.delete(job.id);
       }
     }),
 

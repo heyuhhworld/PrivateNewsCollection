@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useLocation } from "wouter";
 import { trpc } from "@/lib/trpc";
 import { Badge } from "@/components/ui/badge";
@@ -28,6 +28,7 @@ import {
   Tag,
   Upload,
   X,
+  Flame,
 } from "lucide-react";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
@@ -106,21 +107,90 @@ export default function News() {
   const [page, setPage] = useState(1);
   const [listCategory, setListCategory] = useState<"report" | "news">("news");
   const [showBookmarks, setShowBookmarks] = useState(false);
+  /** 与 AI 助手快捷筛选联动：今日 / 本周热度 Top3 */
+  const [smartPreset, setSmartPreset] = useState<null | "today" | "weekTop3">(null);
   const sessionId = useMemo(() => getSessionId(), []);
   const PAGE_SIZE = 15;
 
-  const { data, isLoading, isError, error, refetch } = trpc.news.list.useQuery({
-    source: source || undefined,
-    strategy: strategy || undefined,
-    region: region || undefined,
-    keyword: keyword || undefined,
-    recordCategory: listCategory,
-    dateFrom: dateRange === "week" ? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString() :
-              dateRange === "month" ? new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString() :
-              dateRange === "quarter" ? new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString() : undefined,
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search).get("preset");
+    if (p === "today") setSmartPreset("today");
+    else if (p === "weekTop3") setSmartPreset("weekTop3");
+  }, []);
+
+  useEffect(() => {
+    const h = (e: Event) => {
+      const d = (e as CustomEvent<{ preset: "today" | "weekTop3" }>).detail;
+      if (d?.preset === "today" || d?.preset === "weekTop3") {
+        setSmartPreset(d.preset);
+        setPage(1);
+      }
+    };
+    window.addEventListener("ipms-research-preset", h);
+    return () => window.removeEventListener("ipms-research-preset", h);
+  }, []);
+
+  const listQueryInput = useMemo(() => {
+    const base = {
+      source: source || undefined,
+      strategy: strategy || undefined,
+      region: region || undefined,
+      keyword: keyword || undefined,
+      recordCategory: listCategory,
+      page,
+      pageSize: PAGE_SIZE as number,
+      sortBy: undefined as "published_desc" | "hot_desc" | undefined,
+      dateFrom: undefined as string | undefined,
+      dateTo: undefined as string | undefined,
+    };
+
+    if (smartPreset === "today") {
+      const now = new Date();
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+      return {
+        ...base,
+        dateFrom: start.toISOString(),
+        dateTo: end.toISOString(),
+        sortBy: "published_desc" as const,
+        page: 1,
+        pageSize: PAGE_SIZE,
+      };
+    }
+
+    if (smartPreset === "weekTop3") {
+      return {
+        ...base,
+        dateFrom: new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString(),
+        sortBy: "hot_desc" as const,
+        page: 1,
+        pageSize: 3,
+      };
+    }
+
+    return {
+      ...base,
+      dateFrom:
+        dateRange === "week"
+          ? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString()
+          : dateRange === "month"
+            ? new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString()
+            : dateRange === "quarter"
+              ? new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString()
+              : undefined,
+    };
+  }, [
+    source,
+    strategy,
+    region,
+    keyword,
+    listCategory,
     page,
-    pageSize: PAGE_SIZE,
-  });
+    dateRange,
+    smartPreset,
+  ]);
+
+  const { data, isLoading, isError, error, refetch } = trpc.news.list.useQuery(listQueryInput);
 
   const handleSearch = useCallback(() => {
     setKeyword(searchInput);
@@ -139,14 +209,16 @@ export default function News() {
     setKeyword("");
     setSearchInput("");
     setPage(1);
-  }, []);
+    setSmartPreset(null);
+    setLocation("/news");
+  }, [setLocation]);
 
   const switchListCategory = useCallback((cat: "report" | "news") => {
     setListCategory(cat);
     setPage(1);
   }, []);
 
-  const hasFilters = source || strategy || region || keyword || dateRange;
+  const hasFilters = source || strategy || region || keyword || dateRange || smartPreset;
   const totalPages = data ? Math.ceil(data.total / PAGE_SIZE) : 0;
 
   // Bookmarks
@@ -212,7 +284,9 @@ export default function News() {
             </button>
             {data && (
               <span className="text-sm text-gray-400">
-                共 {data.total} 条
+                {smartPreset === "weekTop3"
+                  ? `近 7 日热度 · 展示前 3 条（候选共 ${data.total} 条）`
+                  : `共 ${data.total} 条`}
               </span>
             )}
           </div>
@@ -396,8 +470,8 @@ export default function News() {
             ) : bookmarksData.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-64 text-gray-400">
                 <Bookmark className="h-12 w-12 mb-3 opacity-30" />
-                <p className="text-sm">暂无稍后再看的资讯</p>
-                <p className="text-xs mt-1 text-gray-300">在资讯列表中点击书签图标即可添加</p>
+                <p className="text-sm">暂无稍后再看的条目</p>
+                <p className="text-xs mt-1 text-gray-300">在列表中点击书签图标即可添加</p>
               </div>
             ) : (
               <div className="p-4 space-y-2">
@@ -481,7 +555,7 @@ export default function News() {
           ) : data?.items.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-64 text-gray-400 px-6 text-center">
               <Newspaper className="h-12 w-12 mb-3 opacity-30" />
-              <p className="text-sm">暂无符合条件的资讯</p>
+              <p className="text-sm">暂无符合条件的资讯条目</p>
               {listCategory === "report" ? (
                 <p className="text-xs text-gray-400 mt-2 max-w-sm leading-relaxed">
                   「报告」仅展示手工上传的文档；Preqin / Pitchbook 等站点抓取的内容在「资讯」标签下。
@@ -535,6 +609,13 @@ export default function News() {
 
                     {/* Right side: date + bookmark + arrow */}
                     <div className="flex flex-col items-end gap-2 shrink-0">
+                      <div
+                        className="inline-flex items-center gap-0.5 text-xs text-amber-700/90 bg-amber-50 border border-amber-100 px-1.5 py-0.5 rounded"
+                        title="热度（详情页浏览累计）"
+                      >
+                        <Flame className="h-3 w-3 text-amber-500" />
+                        {(article as { viewCount?: number }).viewCount ?? 0}
+                      </div>
                       <div className="flex items-center gap-1 text-xs text-gray-400">
                         <Calendar className="h-3 w-3" />
                         {format(new Date(article.publishedAt), "MM月dd日", { locale: zhCN })}
@@ -560,7 +641,7 @@ export default function News() {
           )}
 
           {/* Pagination */}
-          {totalPages > 1 && (
+          {smartPreset !== "weekTop3" && totalPages > 1 && (
             <div className="flex items-center justify-center gap-3 py-4 border-t border-gray-100 bg-white">
               <Button
                 variant="outline"

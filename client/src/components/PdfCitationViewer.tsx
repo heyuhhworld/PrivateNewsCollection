@@ -231,6 +231,9 @@ export function PdfCitationViewer({
   const [renderTick, setRenderTick] = useState(0);
   const [canvasCssSize, setCanvasCssSize] = useState({ w: 0, h: 0 });
 
+  const renderTaskRef = useRef<{ cancel: () => void } | null>(null);
+  const renderGenRef = useRef(0);
+
   const safePage = Math.min(Math.max(1, page), Math.max(1, numPages || 1));
 
   useEffect(() => {
@@ -268,11 +271,20 @@ export function PdfCitationViewer({
       const wrap = wrapRef.current;
       if (!canvas || !wrap) return;
 
+      if (renderTaskRef.current) {
+        renderTaskRef.current.cancel();
+        renderTaskRef.current = null;
+      }
+
+      const gen = ++renderGenRef.current;
+
       const p = await doc.getPage(pageNum);
-      const base = p.getViewport({ scale: 1 });
+      if (gen !== renderGenRef.current) return;
+
+      const base = p.getViewport({ scale: 1, rotation: 0 });
       const cw = wrap.clientWidth || 800;
       const scale = Math.min(Math.max(cw / base.width, 0.5), 3);
-      const viewport = p.getViewport({ scale });
+      const viewport = p.getViewport({ scale, rotation: 0 });
 
       canvas.width = viewport.width;
       canvas.height = viewport.height;
@@ -282,13 +294,22 @@ export function PdfCitationViewer({
 
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      await p
-        .render({ canvasContext: ctx, viewport, canvas })
-        .promise.catch(() => {});
+      const task = p.render({ canvasContext: ctx, viewport, canvas });
+      renderTaskRef.current = task;
 
+      try {
+        await task.promise;
+      } catch {
+        return;
+      }
+      renderTaskRef.current = null;
+
+      if (gen !== renderGenRef.current) return;
       return { p, viewport };
     },
     []
@@ -348,9 +369,16 @@ export function PdfCitationViewer({
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setRenderTick((t) => t + 1));
+    let timer: ReturnType<typeof setTimeout>;
+    const ro = new ResizeObserver(() => {
+      clearTimeout(timer);
+      timer = setTimeout(() => setRenderTick((t) => t + 1), 150);
+    });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      clearTimeout(timer);
+      ro.disconnect();
+    };
   }, []);
 
   if (loadErr) {

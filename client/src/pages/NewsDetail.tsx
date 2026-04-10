@@ -13,7 +13,6 @@ import {
   Globe,
   Newspaper,
   User,
-  FileText,
   GripVertical,
   PanelRightClose,
   PanelRightOpen,
@@ -75,31 +74,6 @@ const SPLIT_MAX = 74;
 /** 左侧文本预览分块行数；引用定位跳转需与此一致 */
 const PREVIEW_LINES_PER_CHUNK = 14;
 
-/** 右侧导读内的定位角标（对照左侧原文件预览） */
-function LocatorBadge({
-  n,
-  title,
-  onLocate,
-}: {
-  n: number;
-  title?: string;
-  onLocate: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      title={title ?? `定位到预览区大致位置（${n}）`}
-      onClick={(e) => {
-        e.preventDefault();
-        onLocate();
-      }}
-      className="inline-flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-[#1677ff] px-1 text-[10px] font-bold leading-none text-white shadow-sm hover:bg-[#0958d9] focus:outline-none focus:ring-2 focus:ring-[#1677ff]/40 align-middle"
-    >
-      {n}
-    </button>
-  );
-}
-
 export default function NewsDetail() {
   const params = useParams<{ id: string }>();
   const [, setLocation] = useLocation();
@@ -149,11 +123,20 @@ export default function NewsDetail() {
   });
 
   const markRead = trpc.news.markRead.useMutation();
+  const recordView = trpc.news.recordView.useMutation();
+  const lastRecordedViewId = useRef<number | null>(null);
 
   useEffect(() => {
     if (article && !article.isRead) {
       markRead.mutate({ id: article.id });
     }
+  }, [article?.id]);
+
+  useEffect(() => {
+    if (!article?.id) return;
+    if (lastRecordedViewId.current === article.id) return;
+    lastRecordedViewId.current = article.id;
+    recordView.mutate({ id: article.id });
   }, [article?.id]);
 
   const handleBookmarkToggle = () => {
@@ -184,8 +167,6 @@ export default function NewsDetail() {
   const attachmentMime = (article as { attachmentMime?: string | null } | undefined)?.attachmentMime;
   const attachmentOriginalName = (article as { attachmentOriginalName?: string | null } | undefined)
     ?.attachmentOriginalName;
-  const keyInsights = (article as { keyInsights?: { label: string; value: string }[] | null } | undefined)
-    ?.keyInsights;
   const extractedLinePageMap = (
     article as { extractedLinePageMap?: number[] | null } | undefined
   )?.extractedLinePageMap;
@@ -224,52 +205,6 @@ export default function NewsDetail() {
   }, [citationLines]);
 
   const isPdfPreview = Boolean(attachmentMime?.toLowerCase().includes("pdf"));
-
-  const anchorMap = useMemo(() => {
-    const L = textPreviewChunks.length;
-    const ch = (x: number) => (L ? Math.min(Math.max(0, x), L - 1) : 0);
-    let n = 1;
-    let summarySpec: { n: number; pdfPage: number; textChunk: number } | null = null;
-    if (article?.summary) {
-      summarySpec = { n: n++, pdfPage: 1, textChunk: ch(0) };
-    }
-    const insightSpecs = (keyInsights ?? []).map((_, i) => ({
-      n: n++,
-      pdfPage: Math.min(i + 2, 400),
-      textChunk: ch(i + 1),
-    }));
-    const sectionSpecs = sections.map((_, idx) => {
-      const pos =
-        sections.length > 0 && L > 1
-          ? Math.floor(((idx + 0.5) / sections.length) * (L - 1))
-          : 0;
-      return {
-        n: n++,
-        pdfPage: Math.min(idx + 1, 400),
-        textChunk: ch(pos),
-      };
-    });
-    return { summarySpec, insightSpecs, sectionSpecs };
-  }, [article?.summary, keyInsights, sections, textPreviewChunks]);
-
-  const locateInPreview = useCallback(
-    (pdfHint: number, textChunk: number) => {
-      (
-        document.getElementById("news-original-preview") ||
-        document.getElementById("news-original-preview-mobile")
-      )?.scrollIntoView({
-        behavior: "smooth",
-        block: "nearest",
-      });
-      if (isPdfPreview) {
-        setPdfPage(Math.max(1, pdfHint));
-      } else {
-        const el = document.getElementById(`news-preview-chunk-${textChunk}`);
-        el?.scrollIntoView({ behavior: "smooth", block: "start" });
-      }
-    },
-    [isPdfPreview]
-  );
 
   useEffect(() => {
     const onLocate = (event: Event) => {
@@ -442,7 +377,7 @@ export default function NewsDetail() {
     </div>
   );
 
-  const renderArticleBody = (opts: { showLocateHints: boolean }) => {
+  const renderArticleBody = () => {
     const contentZh = (article as { contentZh?: string | null }).contentZh?.trim() ?? "";
     const detailBodyText = contentZh || (article.content ?? "");
 
@@ -450,32 +385,12 @@ export default function NewsDetail() {
     <>
       {mainTab === "ai" && (
         <>
-          {opts.showLocateHints && (
-            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-[#1677ff]/15 bg-[#f8fbff] px-3 py-2 text-xs text-gray-600">
-              <FileText className="h-3.5 w-3.5 shrink-0 text-[#1677ff]" />
-              <span>
-                蓝色数字为定位角标：PDF 将按抽取分页翻到对应页；Word/文本将滚动左侧抽取正文对应片段（仅供参考）。
-              </span>
-            </div>
-          )}
-
           {article.summary && (
             <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
               <div className="px-5 py-4 border-b border-gray-50 flex flex-col gap-1">
                 <div className="flex items-center gap-2 flex-wrap">
                   <div className="w-1 h-4 bg-[#1677ff] rounded-full shrink-0" />
                   <h2 className="text-sm font-semibold text-gray-800">AI导读</h2>
-                  {opts.showLocateHints && anchorMap.summarySpec && (
-                    <LocatorBadge
-                      n={anchorMap.summarySpec.n}
-                      onLocate={() =>
-                        locateInPreview(
-                          anchorMap.summarySpec!.pdfPage,
-                          anchorMap.summarySpec!.textChunk
-                        )
-                      }
-                    />
-                  )}
                 </div>
                 <p className="text-xs text-gray-400 pl-3">
                   由 AI 根据资讯内容生成的导读摘要，供快速了解要点。
@@ -484,36 +399,6 @@ export default function NewsDetail() {
               <div className="px-5 py-5">
                 <p className="text-sm text-gray-700 leading-relaxed">{article.summary}</p>
               </div>
-            </div>
-          )}
-
-          {keyInsights && keyInsights.length > 0 && (
-            <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
-              <div className="px-5 py-4 border-b border-gray-50 flex items-center gap-2">
-                <div className="w-1 h-4 bg-emerald-500 rounded-full" />
-                <h2 className="text-sm font-semibold text-gray-800">要点摘录</h2>
-              </div>
-              <ul className="px-5 py-4 space-y-3">
-                {keyInsights.map((row, i) => {
-                  const spec = anchorMap.insightSpecs[i];
-                  return (
-                    <li key={i} className="text-sm text-gray-700 flex gap-2 items-start">
-                      {spec && opts.showLocateHints && (
-                        <LocatorBadge
-                          n={spec.n}
-                          onLocate={() =>
-                            locateInPreview(spec.pdfPage, spec.textChunk)
-                          }
-                        />
-                      )}
-                      <span>
-                        <span className="font-medium text-gray-900">{row.label}：</span>
-                        {row.value}
-                      </span>
-                    </li>
-                  );
-                })}
-              </ul>
             </div>
           )}
 
@@ -526,7 +411,6 @@ export default function NewsDetail() {
               </div>
               {sections.map((section, idx) => {
                 const color = SECTION_COLORS[idx % SECTION_COLORS.length];
-                const spec = anchorMap.sectionSpecs[idx];
                 return (
                   <div
                     key={idx}
@@ -535,14 +419,6 @@ export default function NewsDetail() {
                     <div
                       className={`px-5 py-3.5 border-b border-gray-50 flex items-center gap-2.5 border-l-4 ${color.border} ${color.bg} flex-wrap`}
                     >
-                      {spec && opts.showLocateHints && (
-                        <LocatorBadge
-                          n={spec.n}
-                          onLocate={() =>
-                            locateInPreview(spec.pdfPage, spec.textChunk)
-                          }
-                        />
-                      )}
                       <span className={`w-2 h-2 rounded-full shrink-0 ${color.dot}`} />
                       <h2 className={`text-sm font-semibold ${color.title}`}>
                         {section.heading}
@@ -557,9 +433,7 @@ export default function NewsDetail() {
             </>
           )}
 
-          {!article.summary &&
-            (!keyInsights || keyInsights.length === 0) &&
-            sections.length === 0 && (
+          {!article.summary && sections.length === 0 && (
               <div className="rounded-lg border border-dashed border-gray-200 bg-white px-4 py-8 text-center text-sm text-gray-400">
                 暂无导读内容
               </div>
@@ -844,7 +718,7 @@ export default function NewsDetail() {
                 {previewPanelInner}
               </aside>
               {tabBar}
-              <div className="min-w-0 space-y-4">{renderArticleBody({ showLocateHints: true })}</div>
+              <div className="min-w-0 space-y-4">{renderArticleBody()}</div>
             </div>
 
             <div
@@ -880,7 +754,7 @@ export default function NewsDetail() {
                       </span>
                     </div>
                     <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
-                      {renderArticleBody({ showLocateHints: true })}
+                      {renderArticleBody()}
                     </div>
                   </div>
                 </>
@@ -888,7 +762,7 @@ export default function NewsDetail() {
             </div>
           </>
         ) : (
-          <div className="space-y-4">{renderArticleBody({ showLocateHints: false })}</div>
+          <div className="space-y-4">{renderArticleBody()}</div>
         )}
 
       </div>

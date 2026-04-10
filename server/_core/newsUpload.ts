@@ -59,7 +59,7 @@ async function analyzeDocumentWithLlm(
   extractedText: string,
   originalName: string
 ) {
-  const snippet = extractedText.slice(0, 28_000);
+  const snippet = buildSegmentedSnippet(extractedText, 28_000);
   const llmResponse = await invokeLLM({
     messages: [
       {
@@ -76,9 +76,9 @@ ${snippet}
 Return a JSON object with ALL fields:
 - title: concise English title for the document
 - summary: 2-3 sentences IN CHINESE
-- keyInsights: 3-5 items with "label" (short Chinese, max 8 chars) and "value" (1-2 Chinese sentences), factual from the document only
+- keyInsights: 3-5 items with "label" (short Chinese, max 8 chars) and "value" (1-2 Chinese sentences), factual from the document only. Use direct takeaway tone; do NOT use wording like "文中指出/报告提到/数据显示".
 - content: 6-8 paragraphs IN CHINESE analyzing the document for PE/VC/alternative investment readers
-- sections: 4-6 sections with "heading" and "body" (Chinese), driven by actual content
+- sections: 4-6 sections with "heading" and "body" (Chinese), driven by actual content. Keep the same concise/direct tone as keyInsights; avoid source-referencing phrases like "文中指出/报告显示/作者认为".
 - author: author or institution if inferable, else null
 - publishedAt: best-guess document date as ISO date string (YYYY-MM-DD); if unclear use ${new Date().toISOString().split("T")[0]}
 - effectivePeriodLabel: ONE short line IN CHINESE describing the time period this document's information is relevant for (e.g. "主要涉及 2024Q2 至 2025 年的市场数据" or "未标明具体时效，内容偏方法论"). Required.
@@ -157,6 +157,55 @@ Return a JSON object with ALL fields:
     : llmContent;
 }
 
+/**
+ * 文本过大时做分段提取，避免只看开头导致信息偏差。
+ * - 小文本：直接使用全文（上限）
+ * - 大文本：均匀抽取多个窗口（头/中/尾），并附上段标记
+ */
+function buildSegmentedSnippet(text: string, totalBudget = 28_000): string {
+  const normalized = (text ?? "").trim();
+  if (!normalized) return "";
+  if (normalized.length <= totalBudget) return normalized;
+
+  const segmentCount: number = 6;
+  const segmentBudget = Math.floor(totalBudget / segmentCount);
+  const maxStart = Math.max(0, normalized.length - segmentBudget);
+  const segments: string[] = [];
+
+  for (let i = 0; i < segmentCount; i++) {
+    const ratio = segmentCount === 1 ? 0 : i / (segmentCount - 1);
+    const start = Math.min(maxStart, Math.floor(maxStart * ratio));
+    const end = Math.min(normalized.length, start + segmentBudget);
+    const part = normalized.slice(start, end);
+    if (!part) continue;
+    segments.push(
+      `【片段 ${i + 1}/${segmentCount} | 字符 ${start + 1}-${end}】\n${part}`
+    );
+  }
+  return segments.join("\n\n-----\n\n");
+}
+
+function normalizeExtractErrorMessage(err: unknown): string {
+  const raw = (err as { message?: unknown })?.message;
+  const msg = String(raw ?? err ?? "文本提取失败");
+  const low = msg.toLowerCase();
+  if (
+    low.includes("invalid pdf structure") ||
+    low.includes("invalidpdfexception") ||
+    low.includes("malformed")
+  ) {
+    return "PDF 文件结构异常或已损坏，暂时无法解析。请先用 PDF 阅读器“另存为/打印为 PDF”后重试，或上传 Word 版本。";
+  }
+  return msg;
+}
+
+function normalizeTextForDuplicateCompare(text: string): string {
+  return (text ?? "")
+    .replace(/[\u00AD\u200B\u200C\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function registerNewsUploadRoutes(app: Express) {
   app.post(
     "/api/news/upload-document",
@@ -198,7 +247,45 @@ export function registerNewsUploadRoutes(app: Express) {
           ex.linePageMap && ex.linePageMap.length > 0 ? ex.linePageMap : null;
       } catch (e: any) {
         fs.unlink(file.path, () => {});
-        res.status(400).json({ error: e?.message ?? "文本提取失败" });
+        res.status(400).json({ error: normalizeExtractErrorMessage(e) });
+        return;
+      }
+
+      // Deduplicate: same original filename + same extracted document content.
+      // If matched, skip LLM analysis and DB insert.
+      try {
+        const sameNameCandidates = await db
+          .select({
+            id: newsArticles.id,
+            title: newsArticles.title,
+            extractedText: newsArticles.extractedText,
+          })
+          .from(newsArticles)
+          .where(eq(newsArticles.attachmentOriginalName, file.originalname));
+
+        const currentNormalized = normalizeTextForDuplicateCompare(extracted);
+        const duplicated = sameNameCandidates.find((item) => {
+          const existingNormalized = normalizeTextForDuplicateCompare(
+            item.extractedText ?? ""
+          );
+          return !!existingNormalized && existingNormalized === currentNormalized;
+        });
+
+        if (duplicated) {
+          fs.unlink(file.path, () => {});
+          res.json({
+            success: true,
+            duplicate: true,
+            articleId: duplicated.id,
+            title: duplicated.title,
+            message: "检测到同名且内容一致的报告，已跳过重复上传",
+          });
+          return;
+        }
+      } catch (e) {
+        fs.unlink(file.path, () => {});
+        console.error("[upload-document][deduplicate-check]", e);
+        res.status(500).json({ error: "重复校验失败，请稍后重试" });
         return;
       }
 

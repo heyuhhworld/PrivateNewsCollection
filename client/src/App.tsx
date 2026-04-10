@@ -7,7 +7,6 @@ import DashboardLayout from "./components/DashboardLayout";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import News from "./pages/News";
 import NewsDetail from "./pages/NewsDetail";
-import Dashboard from "./pages/Dashboard";
 import Projects from "./pages/Projects";
 import PlaceholderPage from "./pages/PlaceholderPage";
 import SystemManagement from "./pages/SystemManagement";
@@ -40,11 +39,9 @@ function Router() {
         </DashboardLayout>
       </Route>
 
-      {/* Dashboard */}
+      {/* Root redirect */}
       <Route path="/">
-        <DashboardLayout>
-          <Dashboard />
-        </DashboardLayout>
+        <Redirect to="/news" />
       </Route>
 
       {/* Projects */}

@@ -28,6 +28,18 @@ async function columnExists(conn, table, column) {
   return Number(row.c) > 0;
 }
 
+async function getColumnDataType(conn, table, column) {
+  const [[row]] = await conn.query(
+    `SELECT DATA_TYPE AS dataType FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = ?
+       AND COLUMN_NAME = ?
+     LIMIT 1`,
+    [table, column]
+  );
+  return row?.dataType ? String(row.dataType).toLowerCase() : null;
+}
+
 async function tableExists(conn, table) {
   const [[row]] = await conn.query(
     `SELECT COUNT(*) AS c FROM information_schema.TABLES
@@ -83,8 +95,44 @@ async function main() {
       } else {
         console.log("news_articles.extractedLinePageMap 已存在");
       }
+
+      if (!(await columnExists(conn, "news_articles", "viewCount"))) {
+        const p9 = path.join(root, "drizzle/0009_news_view_count.sql");
+        const sql9 = readFileSync(p9, "utf8").trim();
+        await conn.query(sql9);
+        console.log("已执行 0009：viewCount");
+      } else {
+        console.log("news_articles.viewCount 已存在");
+      }
+
+      const extractedType = await getColumnDataType(
+        conn,
+        "news_articles",
+        "extractedText"
+      );
+      if (extractedType && extractedType !== "longtext") {
+        const p11 = path.join(root, "drizzle/0011_news_extracted_text_longtext.sql");
+        const sql11 = readFileSync(p11, "utf8").trim();
+        await conn.query(sql11);
+        console.log("已执行 0011：extractedText -> LONGTEXT");
+      } else if (extractedType === "longtext") {
+        console.log("news_articles.extractedText 已是 LONGTEXT");
+      }
     } else {
       console.log("跳过 news_articles：表不存在");
+    }
+
+    if (await tableExists(conn, "users")) {
+      if (!(await columnExists(conn, "users", "passwordHash"))) {
+        const p10 = path.join(root, "drizzle/0010_users_password_hash.sql");
+        const sql10 = readFileSync(p10, "utf8").trim();
+        await conn.query(sql10);
+        console.log("已执行 0010：users.passwordHash");
+      } else {
+        console.log("users.passwordHash 已存在");
+      }
+    } else {
+      console.log("跳过 users：表不存在");
     }
 
     console.log("\nschema 检查完成。请重启 pnpm dev 后重试。");

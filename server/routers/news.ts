@@ -17,6 +17,7 @@ import {
   adminListNewsArticles,
   adminSetNewsArticleHidden,
   adminDeleteNewsArticle,
+  incrementArticleViewCount,
 } from "../db";
 import { getDb, getDbUnavailableHint } from "../db";
 import { newsArticles } from "../../drizzle/schema";
@@ -33,6 +34,46 @@ export interface ArticleSection {
 
 /** 正文过短则视为未取到有效内容（反爬/登录墙/纯前端渲染等） */
 const MIN_ARTICLE_TEXT_CHARS = 120;
+
+function isLikelyLoginWall(args: {
+  source: "Preqin" | "Pitchbook";
+  url: string;
+  title?: string | null;
+  text: string;
+  html: string;
+}): boolean {
+  const probe = [
+    args.title ?? "",
+    args.text.slice(0, 1500),
+    args.html.slice(0, 3000),
+    args.url,
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  const genericSignals = [
+    "sign in",
+    "log in",
+    "login",
+    "forgot password",
+    "create account",
+    "remember me",
+    "verify you are human",
+    "captcha",
+  ];
+  const sourceSignals =
+    args.source === "Preqin"
+      ? ["preqin - sign in", "pro.preqin.com/login", "continue with"]
+      : ["pitchbook login", "pitchbook sign in", "account sign in"];
+
+  const hit = [...genericSignals, ...sourceSignals].some((k) => probe.includes(k));
+  if (!hit) return false;
+
+  // 登录页通常正文信息密度很低，进一步减少误判
+  const textLen = args.text.trim().length;
+  const sentenceLike = (args.text.match(/[.!?。！？]/g) || []).length;
+  return textLen < 3000 || sentenceLike < 8;
+}
 
 /**
  * Import a single article URL:
@@ -102,6 +143,21 @@ export async function importSingleArticle(
 
   // ── Step 3: 从 HTML 抽取真实正文 ─────────────────────────────────────────
   const extracted = extractArticleFromHtml(articleHtml, url);
+  if (
+    isLikelyLoginWall({
+      source,
+      url,
+      title: extracted.title ?? "",
+      text: extracted.text,
+      html: articleHtml,
+    })
+  ) {
+    return {
+      status: "failed",
+      error:
+        "检测到登录页/权限页，当前链接无法直接抓取正文。请在系统管理中配置并使用带登录 Cookie 的抓取任务，或先完成站点登录后再导入。",
+    };
+  }
   if (extracted.text.length < MIN_ARTICLE_TEXT_CHARS) {
     return {
       status: "failed",
@@ -133,8 +189,8 @@ ${bodyForLlm}
 请返回 JSON（所有字段必填，strategy/region/author 可 null）：
 - title: 英文标题；若正文前有明确标题可摘录，否则用简短英文概括主题（不得编造具体数据）
 - summary: 2-3 句中文摘要，仅概括正文中实际出现的信息
-- keyInsights: 3-5 条模块化要点，每条含 label（≤8 字中文小标题）与 value（1-2 句中文，仅来自摘录事实）
-- sections: 3-5 个结构化模块，每条含 heading（中文小节标题）与 body（2-4 句中文解读/归纳，严禁编造摘录未出现的数据与引语）
+- keyInsights: 3-5 条模块化要点，每条含 label（≤8 字中文小标题）与 value（1-2 句中文，仅来自摘录事实）；语气要直接给结论，不要写“文中指出/报道提到/数据显示”等转述句式
+- sections: 3-5 个结构化模块，每条含 heading（中文小节标题）与 body（2-4 句中文解读/归纳，严禁编造摘录未出现的数据与引语）；语气与 keyInsights 保持一致，直接陈述，不要“文中指出/报告显示/作者认为”
 - author: 若正文/摘录中能识别作者则填写，否则 null
 - publishedAt: ISO 日期 YYYY-MM-DD；正文无日期则用 ${new Date().toISOString().split("T")[0]}
 - strategy: 从 ["私募股权","风险投资","房地产","信贷","基础设施","对冲基金","母基金","并购","成长股权","其他"] 选一或 null
@@ -292,6 +348,7 @@ export const newsRouter = router({
         page: z.number().int().min(1).default(1),
         pageSize: z.number().int().min(1).max(100).default(20),
         recordCategory: z.enum(["report", "news"]).optional(),
+        sortBy: z.enum(["published_desc", "hot_desc"]).optional(),
       })
     )
     .query(async ({ input }) => {
@@ -330,6 +387,14 @@ export const newsRouter = router({
     .input(z.object({ id: z.number().int() }))
     .mutation(async ({ input }) => {
       await markArticleAsRead(input.id);
+      return { success: true };
+    }),
+
+  /** 详情浏览 +1，用于列表热度 */
+  recordView: publicProcedure
+    .input(z.object({ id: z.number().int() }))
+    .mutation(async ({ input }) => {
+      await incrementArticleViewCount(input.id);
       return { success: true };
     }),
 

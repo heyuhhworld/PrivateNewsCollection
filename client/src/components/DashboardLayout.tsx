@@ -1,4 +1,5 @@
 import { useAuth } from "@/_core/hooks/useAuth";
+import { trpc } from "@/lib/trpc";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import {
   DropdownMenu,
@@ -25,7 +26,7 @@ import { useIsMobile } from "@/hooks/useMobile";
 import {
   MessageCircle,
   Minimize2,
-  BookOpen,
+  Newspaper,
   ChevronDown,
   LogOut,
   PanelLeft,
@@ -36,10 +37,11 @@ import { CSSProperties, useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import { DashboardLayoutSkeleton } from "./DashboardLayoutSkeleton";
 import { Button } from "./ui/button";
+import { Input } from "./ui/input";
 import NewsBot from "./NewsBot";
 
 const menuItems = [
-  { icon: BookOpen, label: "资讯", path: "/news" },
+  { icon: Newspaper, label: "资讯", path: "/news", beta: true },
   { icon: Settings, label: "系统管理", path: "/system" },
 ];
 
@@ -58,6 +60,31 @@ export default function DashboardLayout({
     return saved ? parseInt(saved, 10) : DEFAULT_WIDTH;
   });
   const { loading, user } = useAuth();
+  const utils = trpc.useUtils();
+  const [authMode, setAuthMode] = useState<"login" | "register" | "changePassword">("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNewPassword, setConfirmNewPassword] = useState("");
+  const emailLoginMutation = trpc.auth.emailLogin.useMutation({
+    onSuccess: async () => {
+      await utils.auth.me.invalidate();
+      window.location.href = "/news";
+    },
+  });
+  const emailRegisterMutation = trpc.auth.emailRegister.useMutation({
+    onSuccess: async () => {
+      await utils.auth.me.invalidate();
+      window.location.href = "/news";
+    },
+  });
+  const emailChangePasswordMutation = trpc.auth.emailChangePassword.useMutation();
+
+  const isAuthPending =
+    emailLoginMutation.isPending ||
+    emailRegisterMutation.isPending ||
+    emailChangePasswordMutation.isPending;
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_WIDTH_KEY, sidebarWidth.toString());
@@ -68,9 +95,45 @@ export default function DashboardLayout({
   }
 
   if (!user) {
+    const submitEmailAuth = async () => {
+      try {
+        if (authMode === "register") {
+          await emailRegisterMutation.mutateAsync({
+            name: name.trim(),
+            email,
+            password,
+          });
+          toast.success("注册成功，已自动登录");
+        } else if (authMode === "changePassword") {
+          if (newPassword !== confirmNewPassword) {
+            toast.error("两次输入的新密码不一致");
+            return;
+          }
+          await emailChangePasswordMutation.mutateAsync({
+            email,
+            currentPassword: password,
+            newPassword,
+          });
+          toast.success("密码已更新，请使用新密码登录");
+          setAuthMode("login");
+          setPassword("");
+          setNewPassword("");
+          setConfirmNewPassword("");
+        } else {
+          await emailLoginMutation.mutateAsync({
+            email,
+            password,
+          });
+          toast.success("登录成功");
+        }
+      } catch (e: any) {
+        toast.error(e?.message ?? "操作失败");
+      }
+    };
+
     return (
       <div className="flex items-center justify-center min-h-screen bg-[#f5f7fa]">
-        <div className="flex flex-col items-center gap-8 p-10 max-w-md w-full bg-white rounded-2xl shadow-lg border border-gray-100">
+        <div className="flex flex-col items-center gap-6 p-10 max-w-md w-full bg-white rounded-2xl shadow-lg border border-gray-100">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-lg bg-[#1677ff] flex items-center justify-center">
               <ShieldCheck className="h-5 w-5 text-white" />
@@ -89,22 +152,118 @@ export default function DashboardLayout({
               </p>
             )}
           </div>
-          <Button
-            onClick={() => {
-              const url = getLoginUrl();
-              if (!url) {
-                toast.error(
-                  "未配置登录门户：请设置 VITE_OAUTH_PORTAL_URL（及 VITE_APP_ID），保存后重启；或使用 DEV_ALLOW_AUTH_BYPASS=1 做本地免登录。"
-                );
-                return;
+          <div className="w-full space-y-3">
+            <div className="grid grid-cols-3 gap-1 rounded-lg border border-gray-200 p-1 bg-gray-50">
+              <button
+                type="button"
+                onClick={() => setAuthMode("login")}
+                className={`h-8 text-xs sm:text-sm rounded-md ${authMode === "login" ? "bg-white text-[#1677ff] shadow-sm" : "text-gray-500"}`}
+              >
+                登录
+              </button>
+              <button
+                type="button"
+                onClick={() => setAuthMode("register")}
+                className={`h-8 text-xs sm:text-sm rounded-md ${authMode === "register" ? "bg-white text-[#1677ff] shadow-sm" : "text-gray-500"}`}
+              >
+                注册
+              </button>
+              <button
+                type="button"
+                onClick={() => setAuthMode("changePassword")}
+                className={`h-8 text-xs sm:text-sm rounded-md ${authMode === "changePassword" ? "bg-white text-[#1677ff] shadow-sm" : "text-gray-500"}`}
+              >
+                改密码
+              </button>
+            </div>
+            {authMode === "register" && (
+              <Input
+                placeholder="姓名"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                className="h-10"
+              />
+            )}
+            <Input
+              type="email"
+              placeholder="邮箱"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className="h-10"
+            />
+            <Input
+              type="password"
+              placeholder={
+                authMode === "changePassword" ? "当前密码" : "密码（至少 8 位）"
               }
-              window.location.href = url;
-            }}
-            size="lg"
-            className="w-full bg-[#1677ff] hover:bg-[#0958d9] text-white shadow-md"
-          >
-            登录
-          </Button>
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="h-10"
+              autoComplete={authMode === "changePassword" ? "current-password" : undefined}
+            />
+            {authMode === "changePassword" && (
+              <>
+                <Input
+                  type="password"
+                  placeholder="新密码（至少 8 位）"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  className="h-10"
+                  autoComplete="new-password"
+                />
+                <Input
+                  type="password"
+                  placeholder="确认新密码"
+                  value={confirmNewPassword}
+                  onChange={(e) => setConfirmNewPassword(e.target.value)}
+                  className="h-10"
+                  autoComplete="new-password"
+                />
+              </>
+            )}
+            <Button
+              onClick={() => void submitEmailAuth()}
+              disabled={
+                isAuthPending ||
+                !email.trim() ||
+                !password.trim() ||
+                (authMode === "register" && !name.trim()) ||
+                (authMode === "changePassword" &&
+                  (!newPassword.trim() ||
+                    !confirmNewPassword.trim() ||
+                    newPassword.length < 8))
+              }
+              size="lg"
+              className="w-full bg-[#1677ff] hover:bg-[#0958d9] text-white shadow-md"
+            >
+              {isAuthPending
+                ? "提交中..."
+                : authMode === "register"
+                  ? "注册并登录"
+                  : authMode === "changePassword"
+                    ? "更新密码"
+                    : "登录"}
+            </Button>
+            <div className="pt-1 border-t border-gray-100">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  const url = getLoginUrl();
+                  if (!url) {
+                    toast.error(
+                      "未配置登录门户：请设置 VITE_OAUTH_PORTAL_URL（及 VITE_APP_ID），保存后重启；或使用 DEV_ALLOW_AUTH_BYPASS=1 做本地免登录。"
+                    );
+                    return;
+                  }
+                  window.location.href = url;
+                }}
+                size="sm"
+                className="w-full"
+              >
+                使用 OAuth 登录
+              </Button>
+            </div>
+          </div>
         </div>
       </div>
     );
@@ -142,6 +301,14 @@ function DashboardLayoutContent({
   const sidebarRef = useRef<HTMLDivElement>(null);
   const isMobile = useIsMobile();
   const [botOpen, setBotOpen] = useState(false);
+  const [botSize, setBotSize] = useState({ width: 380, height: 560 });
+  const [isBotResizing, setIsBotResizing] = useState(false);
+  const botResizeStartRef = useRef<{
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null>(null);
   const isNewsRoute = location === "/news" || /^\/news\/\d+$/.test(location);
   const detailMatch = location.match(/^\/news\/(\d+)$/);
   const currentArticleId = detailMatch ? Number(detailMatch[1]) : undefined;
@@ -171,6 +338,33 @@ function DashboardLayoutContent({
       document.body.style.userSelect = "";
     };
   }, [isResizing, setSidebarWidth]);
+
+  useEffect(() => {
+    if (!isBotResizing) return;
+    const onMove = (e: MouseEvent) => {
+      const s = botResizeStartRef.current;
+      if (!s) return;
+      const nextWidth = Math.max(320, Math.min(760, s.width + (s.x - e.clientX)));
+      const nextHeight = Math.max(420, Math.min(window.innerHeight - 80, s.height + (s.y - e.clientY)));
+      setBotSize({ width: nextWidth, height: nextHeight });
+    };
+    const onUp = () => {
+      setIsBotResizing(false);
+      botResizeStartRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    document.body.style.cursor = "nwse-resize";
+    document.body.style.userSelect = "none";
+    return () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [isBotResizing]);
 
   // Determine active path (support /news/:id etc.)
   const activePath = menuItems.find((item) => {
@@ -236,7 +430,14 @@ function DashboardLayoutContent({
                       <item.icon
                         className={`h-4 w-4 shrink-0 ${isActive ? "text-[#1677ff]" : "text-gray-400"}`}
                       />
-                      <span>{item.label}</span>
+                      <span className="flex items-center gap-1.5 min-w-0">
+                        {item.label}
+                        {"beta" in item && item.beta ? (
+                          <span className="text-[10px] font-medium px-1.5 py-0 rounded bg-blue-100 text-blue-600 shrink-0">
+                            Beta
+                          </span>
+                        ) : null}
+                      </span>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                 );
@@ -308,7 +509,15 @@ function DashboardLayoutContent({
         {isNewsRoute && (
           <>
             {botOpen && (
-              <div className="fixed bottom-24 right-6 z-50 w-[380px] max-w-[calc(100vw-1.5rem)] h-[560px] max-h-[calc(100vh-8rem)] rounded-2xl border border-gray-200 bg-white shadow-2xl overflow-hidden">
+              <div
+                className="fixed bottom-24 right-6 z-50 rounded-2xl border border-gray-200 bg-white shadow-2xl overflow-hidden"
+                style={{
+                  width: `${botSize.width}px`,
+                  height: `${botSize.height}px`,
+                  maxWidth: "calc(100vw - 1.5rem)",
+                  maxHeight: "calc(100vh - 8rem)",
+                }}
+              >
                 <div className="absolute right-3 top-3 z-10">
                   <button
                     type="button"
@@ -322,6 +531,20 @@ function DashboardLayoutContent({
                 <NewsBot
                   onClose={() => setBotOpen(false)}
                   articleId={currentArticleId}
+                />
+                <div
+                  className="absolute bottom-0 left-0 h-4 w-4 cursor-nwse-resize"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    botResizeStartRef.current = {
+                      x: e.clientX,
+                      y: e.clientY,
+                      width: botSize.width,
+                      height: botSize.height,
+                    };
+                    setIsBotResizing(true);
+                  }}
+                  title="拖拽调整聊天窗大小"
                 />
               </div>
             )}

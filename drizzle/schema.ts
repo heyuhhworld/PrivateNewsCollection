@@ -14,6 +14,7 @@ export const users = mysqlTable("users", {
   openId: varchar("openId", { length: 64 }).notNull().unique(),
   name: text("name"),
   email: varchar("email", { length: 320 }),
+  passwordHash: varchar("passwordHash", { length: 255 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
   role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -90,6 +91,8 @@ export const newsArticles = mysqlTable("news_articles", {
    * Word/纯文本或未回填的旧数据为 null。
    */
   extractedLinePageMap: json("extractedLinePageMap").$type<number[] | null>(),
+  /** 详情页浏览累计，用于列表热度展示 */
+  viewCount: int("viewCount").default(0).notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 

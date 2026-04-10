@@ -67,6 +67,15 @@ export async function getDb() {
   return _db;
 }
 
+function isOwnerUser(openId: string, email?: string | null): boolean {
+  if (ENV.ownerOpenId && openId === ENV.ownerOpenId) return true;
+  if (!ENV.ownerEmail) return false;
+  const e = ENV.ownerEmail;
+  if (openId === `email:${e}`) return true;
+  if (email && email.trim().toLowerCase() === e) return true;
+  return false;
+}
+
 export async function upsertUser(user: InsertUser): Promise<void> {
   if (!user.openId) throw new Error("User openId is required for upsert");
   const db = await getDb();
@@ -75,7 +84,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
   try {
     const values: InsertUser = { openId: user.openId };
     const updateSet: Record<string, unknown> = {};
-    const textFields = ["name", "email", "loginMethod"] as const;
+    const textFields = ["name", "email", "loginMethod", "passwordHash"] as const;
     type TextField = (typeof textFields)[number];
     const assignNullable = (field: TextField) => {
       const value = user[field];
@@ -92,7 +101,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
     if (user.role !== undefined) {
       values.role = user.role;
       updateSet.role = user.role;
-    } else if (user.openId === ENV.ownerOpenId) {
+    } else if (isOwnerUser(user.openId, user.email)) {
       values.role = "admin";
       updateSet.role = "admin";
     }
@@ -109,6 +118,17 @@ export async function getUserByOpenId(openId: string) {
   const db = await getDb();
   if (!db) return undefined;
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
+  return result.length > 0 ? result[0] : undefined;
+}
+
+export async function getUserByEmail(email: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db
+    .select()
+    .from(users)
+    .where(eq(users.email, email))
+    .limit(1);
   return result.length > 0 ? result[0] : undefined;
 }
 
@@ -132,6 +152,8 @@ export interface NewsFilter {
   page?: number;
   pageSize?: number;
   recordCategory?: "report" | "news";
+  /** 默认按发布时间；hot 按浏览量优先 */
+  sortBy?: "published_desc" | "hot_desc";
 }
 
 export async function getNewsArticles(filter: NewsFilter = {}) {
@@ -148,6 +170,7 @@ export async function getNewsArticles(filter: NewsFilter = {}) {
     page = 1,
     pageSize = 20,
     recordCategory,
+    sortBy = "published_desc",
   } = filter;
 
   const conditions = [eq(newsArticles.isHidden, false)];
@@ -169,12 +192,17 @@ export async function getNewsArticles(filter: NewsFilter = {}) {
 
   const where = and(...conditions);
 
+  const orderByExpr =
+    sortBy === "hot_desc"
+      ? [desc(newsArticles.viewCount), desc(newsArticles.publishedAt)]
+      : [desc(newsArticles.publishedAt)];
+
   const [items, countResult] = await Promise.all([
     db
       .select()
       .from(newsArticles)
       .where(where)
-      .orderBy(desc(newsArticles.publishedAt))
+      .orderBy(...orderByExpr)
       .limit(pageSize)
       .offset((page - 1) * pageSize),
     db
@@ -195,6 +223,19 @@ export async function getNewsArticleById(id: number) {
     .where(eq(newsArticles.id, id))
     .limit(1);
   return result[0] ?? null;
+}
+
+export async function incrementArticleViewCount(id: number) {
+  const db = await getDb();
+  if (!db) return;
+  try {
+    await db
+      .update(newsArticles)
+      .set({ viewCount: sql`${newsArticles.viewCount} + 1` })
+      .where(eq(newsArticles.id, id));
+  } catch (e) {
+    console.warn("[incrementArticleViewCount]", e);
+  }
 }
 
 export async function adminListNewsArticles(opts: {
