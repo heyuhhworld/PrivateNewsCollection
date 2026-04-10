@@ -1,0 +1,62 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1775706469271,
+      "tag": "0000_wooden_whirlwind",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1775706612214,
+      "tag": "0001_dry_landau",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1775706653555,
+      "tag": "0002_blushing_tony_stark",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1775714596662,
+      "tag": "0003_furry_professor_monster",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1775739088297,
+      "tag": "0004_dazzling_viper",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1776000000000,
+      "tag": "0005_crawl_job_auth",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1776100000000,
+      "tag": "0006_news_manual_upload",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "5",
+      "when": 1776200000000,
+      "tag": "0007_news_record_category_visibility",
+      "breakpoints": true
+    }
+  ]
+}

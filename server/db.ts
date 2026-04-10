@@ -1,0 +1,376 @@
+import { and, desc, eq, gte, like, lte, or, sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/mysql2";
+import {
+  InsertUser,
+  chatMessages,
+  InsertChatMessage,
+  newsArticles,
+  users,
+  bookmarks,
+  InsertBookmark,
+  crawlJobs,
+  InsertCrawlJob,
+  crawlLogs,
+  InsertCrawlLog,
+  type NewsArticle,
+} from "../drizzle/schema";
+import { ENV } from "./_core/env";
+
+let _db: ReturnType<typeof drizzle> | null = null;
+let _connectPromise: Promise<void> | null = null;
+let _lastConnectError: string | null = null;
+
+function rootErrorMessage(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const c = (err as Error & { cause?: unknown }).cause;
+  if (c instanceof Error) return c.message;
+  if (c != null && typeof c === "object" && "message" in c) {
+    return String((c as { message: unknown }).message);
+  }
+  return err.message;
+}
+
+/** 供业务层在 getDb() 为 null 时返回给前端的说明 */
+export function getDbUnavailableHint(): string {
+  const url = process.env.DATABASE_URL?.trim();
+  if (!url) {
+    return "未检测到 DATABASE_URL：请在项目根目录 .env 中配置 MySQL 连接串（例如 mysql://用户:密码@127.0.0.1:3306/库名），保存后务必重启 pnpm dev。";
+  }
+  if (_lastConnectError) {
+    return `数据库连接失败：${_lastConnectError}`;
+  }
+  return "数据库暂不可用，请确认 MySQL 已启动，且用户、密码、库名正确；远程数据库需检查网络与白名单。";
+}
+
+async function ensureConnected(): Promise<void> {
+  const url = process.env.DATABASE_URL?.trim();
+  if (!url) return;
+  try {
+    const instance = drizzle(url);
+    await instance.execute(sql.raw("SELECT 1"));
+    _db = instance;
+    _lastConnectError = null;
+  } catch (e) {
+    _db = null;
+    _lastConnectError = rootErrorMessage(e);
+    console.warn("[Database] Connection failed:", _lastConnectError, e);
+  }
+}
+
+export async function getDb() {
+  if (_db) return _db;
+  if (!process.env.DATABASE_URL?.trim()) return null;
+  if (!_connectPromise) {
+    _connectPromise = ensureConnected();
+  }
+  await _connectPromise;
+  return _db;
+}
+
+export async function upsertUser(user: InsertUser): Promise<void> {
+  if (!user.openId) throw new Error("User openId is required for upsert");
+  const db = await getDb();
+  if (!db) return;
+
+  try {
+    const values: InsertUser = { openId: user.openId };
+    const updateSet: Record<string, unknown> = {};
+    const textFields = ["name", "email", "loginMethod"] as const;
+    type TextField = (typeof textFields)[number];
+    const assignNullable = (field: TextField) => {
+      const value = user[field];
+      if (value === undefined) return;
+      const normalized = value ?? null;
+      values[field] = normalized;
+      updateSet[field] = normalized;
+    };
+    textFields.forEach(assignNullable);
+    if (user.lastSignedIn !== undefined) {
+      values.lastSignedIn = user.lastSignedIn;
+      updateSet.lastSignedIn = user.lastSignedIn;
+    }
+    if (user.role !== undefined) {
+      values.role = user.role;
+      updateSet.role = user.role;
+    } else if (user.openId === ENV.ownerOpenId) {
+      values.role = "admin";
+      updateSet.role = "admin";
+    }
+    if (!values.lastSignedIn) values.lastSignedIn = new Date();
+    if (Object.keys(updateSet).length === 0) updateSet.lastSignedIn = new Date();
+    await db.insert(users).values(values).onDuplicateKeyUpdate({ set: updateSet });
+  } catch (error) {
+    console.error("[Database] Failed to upsert user:", error);
+    throw error;
+  }
+}
+
+export async function getUserByOpenId(openId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
+  return result.length > 0 ? result[0] : undefined;
+}
+
+export async function getUserById(id: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  return result.length > 0 ? result[0] : undefined;
+}
+
+// ─── News Articles ───────────────────────────────────────────────────────────
+
+export interface NewsFilter {
+  source?: "Preqin" | "Pitchbook" | "Manual";
+  strategy?: string;
+  region?: string;
+  tag?: string;
+  keyword?: string;
+  dateFrom?: Date;
+  dateTo?: Date;
+  page?: number;
+  pageSize?: number;
+  recordCategory?: "report" | "news";
+}
+
+export async function getNewsArticles(filter: NewsFilter = {}) {
+  const db = await getDb();
+  if (!db) return { items: [], total: 0 };
+
+  const {
+    source,
+    strategy,
+    region,
+    keyword,
+    dateFrom,
+    dateTo,
+    page = 1,
+    pageSize = 20,
+    recordCategory,
+  } = filter;
+
+  const conditions = [eq(newsArticles.isHidden, false)];
+  if (source) conditions.push(eq(newsArticles.source, source));
+  if (strategy) conditions.push(eq(newsArticles.strategy, strategy as any));
+  if (region) conditions.push(eq(newsArticles.region, region as any));
+  if (recordCategory) conditions.push(eq(newsArticles.recordCategory, recordCategory));
+  if (keyword) {
+    const kwExpr = or(
+      like(newsArticles.title, `%${keyword}%`),
+      like(newsArticles.summary, `%${keyword}%`),
+      like(newsArticles.content, `%${keyword}%`),
+      like(newsArticles.extractedText, `%${keyword}%`)
+    );
+    if (kwExpr) conditions.push(kwExpr);
+  }
+  if (dateFrom) conditions.push(gte(newsArticles.publishedAt, dateFrom));
+  if (dateTo) conditions.push(lte(newsArticles.publishedAt, dateTo));
+
+  const where = and(...conditions);
+
+  const [items, countResult] = await Promise.all([
+    db
+      .select()
+      .from(newsArticles)
+      .where(where)
+      .orderBy(desc(newsArticles.publishedAt))
+      .limit(pageSize)
+      .offset((page - 1) * pageSize),
+    db
+      .select({ count: sql<number>`count(*)` })
+      .from(newsArticles)
+      .where(where),
+  ]);
+
+  return { items, total: Number(countResult[0]?.count ?? 0) };
+}
+
+export async function getNewsArticleById(id: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const result = await db
+    .select()
+    .from(newsArticles)
+    .where(eq(newsArticles.id, id))
+    .limit(1);
+  return result[0] ?? null;
+}
+
+export async function adminListNewsArticles(opts: {
+  page?: number;
+  pageSize?: number;
+  visibility?: "all" | "visible" | "hidden";
+}) {
+  const db = await getDb();
+  if (!db) return { items: [] as NewsArticle[], total: 0 };
+  const page = opts.page ?? 1;
+  const pageSize = Math.min(opts.pageSize ?? 30, 100);
+  const conditions = [];
+  if (opts.visibility === "visible") conditions.push(eq(newsArticles.isHidden, false));
+  if (opts.visibility === "hidden") conditions.push(eq(newsArticles.isHidden, true));
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+  const [items, countResult] = await Promise.all([
+    db
+      .select()
+      .from(newsArticles)
+      .where(where)
+      .orderBy(desc(newsArticles.publishedAt))
+      .limit(pageSize)
+      .offset((page - 1) * pageSize),
+    db
+      .select({ count: sql<number>`count(*)` })
+      .from(newsArticles)
+      .where(where),
+  ]);
+
+  return { items, total: Number(countResult[0]?.count ?? 0) };
+}
+
+export async function adminSetNewsArticleHidden(id: number, isHidden: boolean) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(newsArticles).set({ isHidden }).where(eq(newsArticles.id, id));
+}
+
+export async function adminDeleteNewsArticle(id: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(bookmarks).where(eq(bookmarks.articleId, id));
+  await db.delete(newsArticles).where(eq(newsArticles.id, id));
+}
+
+export async function markArticleAsRead(id: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(newsArticles).set({ isRead: true }).where(eq(newsArticles.id, id));
+}
+
+// ─── Bookmarks ────────────────────────────────────────────────────────────────
+
+export async function addBookmark(data: InsertBookmark) {
+  const db = await getDb();
+  if (!db) return null;
+  // Check if already bookmarked
+  const conditions = [eq(bookmarks.articleId, data.articleId)];
+  if (data.userId) conditions.push(eq(bookmarks.userId, data.userId));
+  else if (data.sessionId) conditions.push(eq(bookmarks.sessionId, data.sessionId));
+  const existing = await db.select().from(bookmarks).where(and(...conditions)).limit(1);
+  if (existing.length > 0) return existing[0];
+  await db.insert(bookmarks).values(data);
+  const inserted = await db.select().from(bookmarks).where(and(...conditions)).limit(1);
+  return inserted[0] ?? null;
+}
+
+export async function removeBookmark(articleId: number, userId?: number, sessionId?: string) {
+  const db = await getDb();
+  if (!db) return;
+  const conditions = [eq(bookmarks.articleId, articleId)];
+  if (userId) conditions.push(eq(bookmarks.userId, userId));
+  else if (sessionId) conditions.push(eq(bookmarks.sessionId, sessionId));
+  await db.delete(bookmarks).where(and(...conditions));
+}
+
+export async function getBookmarks(userId?: number, sessionId?: string) {
+  const db = await getDb();
+  if (!db) return [];
+  const conditions = [];
+  if (userId) conditions.push(eq(bookmarks.userId, userId));
+  else if (sessionId) conditions.push(eq(bookmarks.sessionId, sessionId));
+  if (conditions.length === 0) return [];
+  return db
+    .select()
+    .from(bookmarks)
+    .where(and(...conditions))
+    .orderBy(desc(bookmarks.createdAt));
+}
+
+export async function isBookmarked(articleId: number, userId?: number, sessionId?: string) {
+  const db = await getDb();
+  if (!db) return false;
+  const conditions = [eq(bookmarks.articleId, articleId)];
+  if (userId) conditions.push(eq(bookmarks.userId, userId));
+  else if (sessionId) conditions.push(eq(bookmarks.sessionId, sessionId));
+  const result = await db.select().from(bookmarks).where(and(...conditions)).limit(1);
+  return result.length > 0;
+}
+
+// ─── Crawl Jobs ────────────────────────────────────────────────────────────────
+
+export async function getCrawlJobs() {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(crawlJobs).orderBy(desc(crawlJobs.createdAt));
+}
+
+export async function getCrawlJobById(id: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const result = await db.select().from(crawlJobs).where(eq(crawlJobs.id, id)).limit(1);
+  return result[0] ?? null;
+}
+
+export async function createCrawlJob(data: InsertCrawlJob) {
+  const db = await getDb();
+  if (!db) return null;
+  await db.insert(crawlJobs).values(data);
+  const inserted = await db.select().from(crawlJobs).orderBy(desc(crawlJobs.createdAt)).limit(1);
+  return inserted[0] ?? null;
+}
+
+export async function updateCrawlJob(id: number, data: Partial<InsertCrawlJob>) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(crawlJobs).set(data).where(eq(crawlJobs.id, id));
+}
+
+export async function deleteCrawlJob(id: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(crawlJobs).where(eq(crawlJobs.id, id));
+}
+
+export async function getCrawlLogs(jobId?: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const where = jobId ? eq(crawlLogs.jobId, jobId) : undefined;
+  return db
+    .select()
+    .from(crawlLogs)
+    .where(where)
+    .orderBy(desc(crawlLogs.startedAt))
+    .limit(50);
+}
+
+export async function createCrawlLog(data: InsertCrawlLog) {
+  const db = await getDb();
+  if (!db) return null;
+  await db.insert(crawlLogs).values(data);
+  const inserted = await db.select().from(crawlLogs).orderBy(desc(crawlLogs.startedAt)).limit(1);
+  return inserted[0] ?? null;
+}
+
+export async function updateCrawlLog(id: number, data: Partial<InsertCrawlLog>) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(crawlLogs).set(data).where(eq(crawlLogs.id, id));
+}
+
+// ─── Chat Messages ────────────────────────────────────────────────────────────
+
+export async function getChatHistory(sessionId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(chatMessages)
+    .where(eq(chatMessages.sessionId, sessionId))
+    .orderBy(chatMessages.createdAt);
+}
+
+export async function saveChatMessage(msg: InsertChatMessage) {
+  const db = await getDb();
+  if (!db) return;
+  await db.insert(chatMessages).values(msg);
+}
