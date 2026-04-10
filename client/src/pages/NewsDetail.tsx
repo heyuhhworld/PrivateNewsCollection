@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useParams } from "wouter";
 import { trpc } from "@/lib/trpc";
-import { useAuth } from "@/_core/hooks/useAuth";
-import ArticleFileChat from "@/components/ArticleFileChat";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
@@ -24,6 +22,7 @@ import {
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
 import { cn } from "@/lib/utils";
+import { PdfCitationViewer } from "@/components/PdfCitationViewer";
 
 // 获取或生成持久化的 sessionId
 function getSessionId(): string {
@@ -73,6 +72,9 @@ const SPLIT_DEFAULT = 54;
 const SPLIT_MIN = 26;
 const SPLIT_MAX = 74;
 
+/** 左侧文本预览分块行数；引用定位跳转需与此一致 */
+const PREVIEW_LINES_PER_CHUNK = 14;
+
 /** 右侧导读内的定位角标（对照左侧原文件预览） */
 function LocatorBadge({
   n,
@@ -103,13 +105,19 @@ export default function NewsDetail() {
   const [, setLocation] = useLocation();
   const id = parseInt(params.id ?? "0");
   const sessionId = useMemo(() => getSessionId(), []);
-  const { user } = useAuth();
   /** 报告式详情：AI导读 / 资讯正文 */
   const [mainTab, setMainTab] = useState<MainTab>("ai");
   const [splitPct, setSplitPct] = useState(SPLIT_DEFAULT);
   const [insightPanelOpen, setInsightPanelOpen] = useState(true);
   /** PDF 内嵌预览页码（浏览器内置查看器支持 #page= 时生效，仅为大致定位） */
   const [pdfPage, setPdfPage] = useState(1);
+  /** 与 chat 引用 L 行号一致：基于「非空行」连续编号（同 server/routers/chat.ts） */
+  const [citationHighlight, setCitationHighlight] = useState<{
+    startLine: number;
+    endLine: number;
+    page: number;
+    quote?: string;
+  } | null>(null);
   const splitRef = useRef<HTMLDivElement>(null);
   const splitDragRef = useRef<{ startX: number; startPct: number; lastPct: number } | null>(
     null
@@ -172,11 +180,15 @@ export default function NewsDetail() {
   const attachmentPublicUrl = (article as { attachmentPublicUrl?: string | null } | undefined)
     ?.attachmentPublicUrl;
   const extractedText = (article as { extractedText?: string | null } | undefined)?.extractedText;
+  const articleContent = (article as { content?: string | null } | undefined)?.content;
   const attachmentMime = (article as { attachmentMime?: string | null } | undefined)?.attachmentMime;
   const attachmentOriginalName = (article as { attachmentOriginalName?: string | null } | undefined)
     ?.attachmentOriginalName;
   const keyInsights = (article as { keyInsights?: { label: string; value: string }[] | null } | undefined)
     ?.keyInsights;
+  const extractedLinePageMap = (
+    article as { extractedLinePageMap?: number[] | null } | undefined
+  )?.extractedLinePageMap;
 
   useEffect(() => {
     setPdfPage(1);
@@ -196,16 +208,20 @@ export default function NewsDetail() {
     }
   }, []);
 
+  const citationSource = ((extractedText ?? articleContent) ?? "").trim();
+  const citationLines = useMemo(
+    () => citationSource.split(/\r?\n/).filter((l) => l.trim().length > 0),
+    [citationSource]
+  );
+
   const textPreviewChunks = useMemo(() => {
-    if (!extractedText?.trim()) return [] as string[];
-    const lines = extractedText.split("\n");
-    const size = 14;
+    if (citationLines.length === 0) return [] as string[];
     const chunks: string[] = [];
-    for (let i = 0; i < lines.length; i += size) {
-      chunks.push(lines.slice(i, i + size).join("\n"));
+    for (let i = 0; i < citationLines.length; i += PREVIEW_LINES_PER_CHUNK) {
+      chunks.push(citationLines.slice(i, i + PREVIEW_LINES_PER_CHUNK).join("\n"));
     }
-    return chunks.length ? chunks : [extractedText];
-  }, [extractedText]);
+    return chunks;
+  }, [citationLines]);
 
   const isPdfPreview = Boolean(attachmentMime?.toLowerCase().includes("pdf"));
 
@@ -254,6 +270,60 @@ export default function NewsDetail() {
     },
     [isPdfPreview]
   );
+
+  useEffect(() => {
+    const onLocate = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        articleId: number;
+        page: number;
+        startLine: number;
+        endLine: number;
+        quote?: string;
+      }>).detail;
+      if (!detail || detail.articleId !== id) return;
+      const startLine = Math.max(1, detail.startLine || 1);
+      const endLine = Math.max(startLine, detail.endLine || startLine);
+      const map = extractedLinePageMap;
+      const lineIdx = startLine - 1;
+      const pageFromMap =
+        Array.isArray(map) && map[lineIdx] != null
+          ? Math.max(1, Math.floor(Number(map[lineIdx]) || 1))
+          : null;
+      const page = pageFromMap ?? Math.max(1, detail.page || 1);
+      const quote = typeof detail.quote === "string" ? detail.quote.trim() : "";
+      setCitationHighlight({
+        startLine,
+        endLine,
+        page,
+        quote: quote || undefined,
+      });
+      (
+        document.getElementById("news-original-preview") ||
+        document.getElementById("news-original-preview-mobile")
+      )?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      if (isPdfPreview) {
+        setPdfPage(page);
+      } else {
+        const targetChunk = Math.floor((startLine - 1) / PREVIEW_LINES_PER_CHUNK);
+        const el = document.getElementById(`news-preview-chunk-${targetChunk}`);
+        el?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    };
+    window.addEventListener("ipms-locate-reference", onLocate as EventListener);
+    return () =>
+      window.removeEventListener("ipms-locate-reference", onLocate as EventListener);
+  }, [id, isPdfPreview, extractedLinePageMap]);
+
+  useEffect(() => {
+    if (!citationHighlight) return;
+    const t = window.setTimeout(() => {
+      const el = document.querySelector(
+        `[data-citation-line="${citationHighlight.startLine}"]`
+      );
+      el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, isPdfPreview ? 220 : 120);
+    return () => window.clearTimeout(t);
+  }, [citationHighlight, isPdfPreview]);
 
   const startSplitDrag = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -384,7 +454,7 @@ export default function NewsDetail() {
             <div className="flex flex-wrap items-center gap-2 rounded-lg border border-[#1677ff]/15 bg-[#f8fbff] px-3 py-2 text-xs text-gray-600">
               <FileText className="h-3.5 w-3.5 shrink-0 text-[#1677ff]" />
               <span>
-                蓝色数字为定位角标：PDF 将尝试翻到大致页码；Word/文本将滚动左侧抽取正文对应片段（仅供参考）。
+                蓝色数字为定位角标：PDF 将按抽取分页翻到对应页；Word/文本将滚动左侧抽取正文对应片段（仅供参考）。
               </span>
             </div>
           )}
@@ -580,27 +650,59 @@ export default function NewsDetail() {
           </a>
         </div>
       </div>
-      <div className="p-2 flex-1 min-h-0 bg-gray-50/50 flex flex-col overflow-hidden">
+      <div className="p-2 flex-1 min-h-0 bg-gray-50/50 flex flex-col overflow-hidden gap-2">
         {attachmentMime?.includes("pdf") ? (
-          <iframe
-            key={`pdf-${pdfPage}`}
-            title="原文 PDF"
-            src={`${previewUrl}#page=${pdfPage}`}
-            className="w-full flex-1 min-h-[200px] rounded-lg border border-gray-200 bg-white"
-          />
+          <>
+            <div className="flex w-full flex-1 min-h-[280px] shrink-0 flex-col">
+              <PdfCitationViewer
+                url={previewUrl}
+                page={pdfPage}
+                onPageChange={setPdfPage}
+                citationHighlight={citationHighlight}
+                citationLines={citationLines}
+              />
+            </div>
+          </>
         ) : (
           <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-gray-200 bg-white p-3">
             {textPreviewChunks.length > 0 ? (
               textPreviewChunks.map((chunk, ci) => (
                 <div key={ci} id={`news-preview-chunk-${ci}`} className="mb-4 scroll-mt-2">
-                  <pre className="text-xs text-gray-700 whitespace-pre-wrap font-sans leading-relaxed">
-                    {chunk}
-                  </pre>
+                  <div className="rounded-md border border-gray-100 overflow-hidden">
+                    {chunk.split("\n").map((line, li) => {
+                      const lineNo = ci * PREVIEW_LINES_PER_CHUNK + li + 1;
+                      const highlighted =
+                        !!citationHighlight &&
+                        lineNo >= citationHighlight.startLine &&
+                        lineNo <= citationHighlight.endLine;
+                      return (
+                        <div
+                          key={`${ci}-${li}`}
+                          data-citation-line={lineNo}
+                          className={cn(
+                            "grid grid-cols-[56px_1fr] gap-2 px-2 py-0.5 text-xs leading-relaxed transition-colors",
+                            highlighted
+                              ? "bg-amber-100 border-l-2 border-amber-400 shadow-[inset_0_0_0_1px_rgba(251,191,36,0.35)]"
+                              : "bg-white border-l-2 border-transparent"
+                          )}
+                        >
+                          <span className="text-gray-400 text-right select-none tabular-nums">
+                            {lineNo}
+                          </span>
+                          <span className="text-gray-800 whitespace-pre-wrap font-sans">
+                            {line || " "}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               ))
             ) : (
               <pre className="text-xs text-gray-700 whitespace-pre-wrap font-sans leading-relaxed">
-                {extractedText || "（无抽取文本，请下载查看）"}
+                {citationSource
+                  ? citationSource
+                  : "（无抽取文本，请下载查看）"}
               </pre>
             )}
           </div>
@@ -789,9 +891,6 @@ export default function NewsDetail() {
           <div className="space-y-4">{renderArticleBody({ showLocateHints: false })}</div>
         )}
 
-        {isManual && (
-          <ArticleFileChat articleId={article.id} userId={user?.id} />
-        )}
       </div>
     </div>
   );

@@ -23,6 +23,8 @@ import { getLoginUrl, isOAuthLoginConfigured } from "@/const";
 import { toast } from "sonner";
 import { useIsMobile } from "@/hooks/useMobile";
 import {
+  MessageCircle,
+  Minimize2,
   BookOpen,
   ChevronDown,
   LogOut,
@@ -34,6 +36,7 @@ import { CSSProperties, useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import { DashboardLayoutSkeleton } from "./DashboardLayoutSkeleton";
 import { Button } from "./ui/button";
+import NewsBot from "./NewsBot";
 
 const menuItems = [
   { icon: BookOpen, label: "资讯", path: "/news" },
@@ -138,6 +141,10 @@ function DashboardLayoutContent({
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const isMobile = useIsMobile();
+  const [botOpen, setBotOpen] = useState(false);
+  const isNewsRoute = location === "/news" || /^\/news\/\d+$/.test(location);
+  const detailMatch = location.match(/^\/news\/(\d+)$/);
+  const currentArticleId = detailMatch ? Number(detailMatch[1]) : undefined;
 
   useEffect(() => {
     if (isCollapsed) setIsResizing(false);
@@ -297,6 +304,42 @@ function DashboardLayoutContent({
           </div>
         )}
         <main className="flex-1 min-h-screen">{children}</main>
+
+        {isNewsRoute && (
+          <>
+            {botOpen && (
+              <div className="fixed bottom-24 right-6 z-50 w-[380px] max-w-[calc(100vw-1.5rem)] h-[560px] max-h-[calc(100vh-8rem)] rounded-2xl border border-gray-200 bg-white shadow-2xl overflow-hidden">
+                <div className="absolute right-3 top-3 z-10">
+                  <button
+                    type="button"
+                    onClick={() => setBotOpen(false)}
+                    className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-500 hover:text-gray-700 hover:bg-gray-50"
+                    title="最小化"
+                  >
+                    <Minimize2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+                <NewsBot
+                  onClose={() => setBotOpen(false)}
+                  articleId={currentArticleId}
+                />
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setBotOpen((v) => !v)}
+              className="fixed bottom-6 right-6 z-50 inline-flex h-14 w-14 items-center justify-center rounded-full bg-[#1677ff] text-white shadow-xl hover:bg-[#0958d9] transition-colors"
+              title={
+                currentArticleId
+                  ? "唤起 AI 助手（当前文章问答）"
+                  : "唤起 AI 助手"
+              }
+            >
+              <MessageCircle className="h-6 w-6" />
+            </button>
+          </>
+        )}
       </SidebarInset>
     </>
   );

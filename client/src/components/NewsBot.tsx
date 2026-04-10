@@ -19,6 +19,12 @@ type Message = {
   role: "user" | "assistant";
   content: string;
   id: string;
+  references?: Array<{
+    page: number;
+    startLine: number;
+    endLine: number;
+    quote?: string;
+  }>;
 };
 
 const SUGGESTED_PROMPTS = [
@@ -32,9 +38,10 @@ const SUGGESTED_PROMPTS = [
 
 interface NewsBotProps {
   onClose: () => void;
+  articleId?: number;
 }
 
-export default function NewsBot({ onClose }: NewsBotProps) {
+export default function NewsBot({ onClose, articleId }: NewsBotProps) {
   const [sessionId] = useState(() => nanoid());
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -72,12 +79,14 @@ export default function NewsBot({ onClose }: NewsBotProps) {
       const result = await sendMutation.mutateAsync({
         sessionId,
         message: content,
+        articleId,
         origin: window.location.origin,
       });
       const assistantMsg: Message = {
         role: "assistant",
         content: result.content,
         id: nanoid(),
+        references: result.references,
       };
       setMessages((prev) => [...prev, assistantMsg]);
     } catch (err) {
@@ -110,7 +119,11 @@ export default function NewsBot({ onClose }: NewsBotProps) {
           </div>
           <div>
             <p className="text-sm font-semibold text-gray-800">AI 资讯助手</p>
-            <p className="text-xs text-gray-400">基于最新资讯数据分析</p>
+            <p className="text-xs text-gray-400">
+              {articleId
+                ? "当前为本文问答模式（默认严格基于当前资讯/报告）"
+                : "基于资讯/报告库数据分析"}
+            </p>
           </div>
         </div>
         <Button
@@ -136,8 +149,17 @@ export default function NewsBot({ onClose }: NewsBotProps) {
                   资讯智能分析助手
                 </p>
                 <p className="text-xs text-gray-400 leading-relaxed">
-                  我可以帮您查询、整理、总结和分析<br />
-                  Preqin 和 Pitchbook 的最新资讯
+                  {articleId ? (
+                    <>
+                      我将围绕当前详情页文档进行问答<br />
+                      回答默认严格基于当前文档内容
+                    </>
+                  ) : (
+                    <>
+                      我可以帮您查询、整理、总结和分析<br />
+                      Preqin 和 Pitchbook 的最新资讯
+                    </>
+                  )}
                 </p>
               </div>
             </div>
@@ -146,7 +168,15 @@ export default function NewsBot({ onClose }: NewsBotProps) {
             <div className="space-y-2">
               <p className="text-xs text-gray-400 text-center mb-3">快速提问</p>
               <div className="grid grid-cols-1 gap-1.5">
-                {SUGGESTED_PROMPTS.map((prompt) => (
+                {(articleId
+                  ? [
+                      "请总结这篇内容的核心结论",
+                      "这篇文章涉及哪些关键数据？",
+                      "请给出这篇内容的结构化要点",
+                      "文中有哪些风险与机会信号？",
+                    ]
+                  : SUGGESTED_PROMPTS
+                ).map((prompt) => (
                   <button
                     key={prompt}
                     onClick={() => handleSend(prompt)}
@@ -182,8 +212,54 @@ export default function NewsBot({ onClose }: NewsBotProps) {
                     }`}
                   >
                     {msg.role === "assistant" ? (
-                      <div className="prose prose-sm max-w-none text-gray-700">
-                        <Streamdown>{msg.content}</Streamdown>
+                      <div className="space-y-2">
+                        <div className="prose prose-sm max-w-none text-gray-700">
+                          <Streamdown>{msg.content}</Streamdown>
+                        </div>
+                        {articleId &&
+                          msg.references &&
+                          msg.references.length > 0 && (
+                            <div className="rounded-lg border border-blue-100 bg-blue-50/50 p-2 space-y-1.5">
+                              <p className="text-[11px] text-blue-700 font-medium">
+                                引用定位（点击跳转）
+                              </p>
+                              <div className="flex flex-col gap-1.5 max-w-full">
+                                {msg.references.map((ref, idx) => (
+                                  <div
+                                    key={`${msg.id}-ref-${idx}`}
+                                    className="rounded-md border border-blue-200/80 bg-white overflow-hidden w-full min-w-[200px] max-w-full"
+                                  >
+                                    <button
+                                      type="button"
+                                      className="w-full text-left text-[11px] px-2 py-1.5 text-blue-700 hover:bg-blue-50 font-medium"
+                                      title={ref.quote ?? "定位到原文对应行"}
+                                      onClick={() => {
+                                        window.dispatchEvent(
+                                          new CustomEvent("ipms-locate-reference", {
+                                            detail: {
+                                              articleId,
+                                              page: ref.page,
+                                              startLine: ref.startLine,
+                                              endLine: ref.endLine,
+                                              quote: ref.quote ?? "",
+                                            },
+                                          })
+                                        );
+                                      }}
+                                    >
+                                      定位：第{ref.page}页 · L{ref.startLine}–{ref.endLine}
+                                    </button>
+                                    {ref.quote ? (
+                                      <p className="text-[10px] leading-relaxed text-gray-700 px-2 pb-2 pt-0 border-t border-amber-100 bg-amber-50/90">
+                                        <span className="text-amber-800/80 font-medium">摘录 </span>
+                                        {ref.quote}
+                                      </p>
+                                    ) : null}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                       </div>
                     ) : (
                       <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
@@ -242,7 +318,9 @@ export default function NewsBot({ onClose }: NewsBotProps) {
           </Button>
         </div>
         <p className="text-xs text-gray-400 mt-1.5 text-center">
-          AI 回答基于最新资讯数据，仅供参考
+          {articleId
+            ? "当前回答默认仅基于本页资讯/报告内容，并附引用源"
+            : "AI 回答基于资讯/报告数据，仅供参考"}
         </p>
       </div>
     </div>

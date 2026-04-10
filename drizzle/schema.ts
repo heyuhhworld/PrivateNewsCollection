@@ -85,6 +85,11 @@ export const newsArticles = mysqlTable("news_articles", {
   effectivePeriodLabel: varchar("effectivePeriodLabel", { length: 512 }),
   /** 从 PDF/Word 抽取的全文，供预览与 AI 问答 */
   extractedText: text("extractedText"),
+  /**
+   * PDF 抽取时：与 extractedText 按行对齐（非空行），每项为该行在 PDF 中的真实页码（1-based）。
+   * Word/纯文本或未回填的旧数据为 null。
+   */
+  extractedLinePageMap: json("extractedLinePageMap").$type<number[] | null>(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 

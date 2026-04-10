@@ -181,6 +181,9 @@ importers:
       pdf-parse:
         specifier: ^2.4.5
         version: 2.4.5
+      pdfjs-dist:
+        specifier: 5.4.296
+        version: 5.4.296
       playwright:
         specifier: ^1.59.1
         version: 1.59.1

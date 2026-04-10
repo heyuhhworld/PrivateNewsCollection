@@ -10,6 +10,12 @@ const INVALID_FILENAME_CHARS = /[<>:"/\\|?*\u0000-\u001f]/g;
 /** Windows 保留设备名（仅校验主文件名，不含扩展名） */
 const WIN_RESERVED_STEM = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
 
+export type ExtractTextResult = {
+  text: string;
+  /** 与 text 按「非空行」对齐的 PDF 真实页码；非 PDF 时为 undefined */
+  linePageMap?: number[];
+};
+
 export function normalizeExtension(filename: string): string {
   const m = filename.toLowerCase().match(/\.([a-z0-9]+)$/);
   return m ? `.${m[1]}` : "";
@@ -43,18 +49,69 @@ export function buildUniqueStoredUploadFilename(
   return candidate;
 }
 
+function truncateLinesToMaxChars(
+  lineTexts: string[],
+  linePageMap: number[],
+  maxChars: number
+): { text: string; linePageMap: number[] } {
+  let total = 0;
+  const outLines: string[] = [];
+  const outMap: number[] = [];
+  for (let i = 0; i < lineTexts.length; i++) {
+    const add = lineTexts[i].length + (outLines.length > 0 ? 1 : 0);
+    if (total + add > maxChars) break;
+    outLines.push(lineTexts[i]);
+    outMap.push(linePageMap[i]!);
+    total += add;
+  }
+  return { text: outLines.join("\n"), linePageMap: outMap };
+}
+
 export async function extractTextFromFile(
   buffer: Buffer,
   mime: string,
   ext: string
-): Promise<string> {
-  let raw = "";
+): Promise<ExtractTextResult> {
   const m = mime.toLowerCase();
   if (m.includes("pdf") || ext === ".pdf") {
     const parser = new PDFParse({ data: new Uint8Array(buffer) });
-    const result = await parser.getText();
-    raw = result.text ?? "";
-  } else if (
+    try {
+      const result = await parser.getText();
+      const pages = [...result.pages].sort((a, b) => a.num - b.num);
+      const linePageMap: number[] = [];
+      const lineTexts: string[] = [];
+      for (const p of pages) {
+        const lines = p.text.split(/\r?\n/);
+        for (const line of lines) {
+          const t = line.trim();
+          if (t.length > 0) {
+            lineTexts.push(t);
+            linePageMap.push(Math.max(1, p.num));
+          }
+        }
+      }
+      let text = lineTexts.join("\n");
+      if (!text.replace(/\0/g, "").trim() || lineTexts.length === 0) {
+        throw new Error("未能从文件中提取到文本，请确认文件未加密或损坏");
+      }
+      text = text.replace(/\0/g, "").trim();
+      if (text.length > MAX_EXTRACT_CHARS) {
+        const truncated = truncateLinesToMaxChars(
+          lineTexts,
+          linePageMap,
+          MAX_EXTRACT_CHARS
+        );
+        text = truncated.text;
+        return { text, linePageMap: truncated.linePageMap };
+      }
+      return { text, linePageMap };
+    } finally {
+      await parser.destroy().catch(() => {});
+    }
+  }
+
+  let raw = "";
+  if (
     m.includes("wordprocessingml") ||
     m.includes("msword") ||
     ext === ".docx"
@@ -71,7 +128,7 @@ export async function extractTextFromFile(
     throw new Error("未能从文件中提取到文本，请确认文件未加密或损坏");
   }
   if (raw.length > MAX_EXTRACT_CHARS) {
-    return raw.slice(0, MAX_EXTRACT_CHARS);
+    return { text: raw.slice(0, MAX_EXTRACT_CHARS) };
   }
-  return raw;
+  return { text: raw };
 }

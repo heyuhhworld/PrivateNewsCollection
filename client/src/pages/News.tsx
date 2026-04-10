@@ -14,7 +14,6 @@ import {
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  Bot,
   Bookmark,
   BookmarkCheck,
   Calendar,
@@ -32,7 +31,6 @@ import {
 } from "lucide-react";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
-import NewsBot from "@/components/NewsBot";
 import { useMemo } from "react";
 
 const STRATEGIES = [
@@ -107,12 +105,11 @@ export default function News() {
   const [dateRange, setDateRange] = useState("");
   const [page, setPage] = useState(1);
   const [listCategory, setListCategory] = useState<"report" | "news">("news");
-  const [showBot, setShowBot] = useState(false);
   const [showBookmarks, setShowBookmarks] = useState(false);
   const sessionId = useMemo(() => getSessionId(), []);
   const PAGE_SIZE = 15;
 
-  const { data, isLoading, refetch } = trpc.news.list.useQuery({
+  const { data, isLoading, isError, error, refetch } = trpc.news.list.useQuery({
     source: source || undefined,
     strategy: strategy || undefined,
     region: region || undefined,
@@ -228,15 +225,6 @@ export default function News() {
             >
               <RefreshCw className="h-3.5 w-3.5" />
               刷新
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => setShowBot(!showBot)}
-              className={`h-8 gap-1.5 ${showBot ? "bg-[#1677ff] text-white" : "bg-[#e8f0fe] text-[#1677ff] hover:bg-[#d0e4ff]"}`}
-              variant="ghost"
-            >
-              <Bot className="h-3.5 w-3.5" />
-              AI 助手
             </Button>
           </div>
         </div>
@@ -468,10 +456,37 @@ export default function News() {
                 </div>
               ))}
             </div>
+          ) : isError ? (
+            <div className="flex flex-col items-center justify-center min-h-64 px-6 py-12 text-center">
+              <Newspaper className="h-12 w-12 mb-3 text-red-200" />
+              <p className="text-sm font-medium text-red-700">列表加载失败</p>
+              <p className="text-xs text-red-600/90 mt-2 max-w-lg break-words">
+                {error?.message ?? "未知错误"}
+              </p>
+              <p className="text-xs text-gray-500 mt-4 max-w-md leading-relaxed">
+                若错误中含 Unknown column，说明数据库结构与代码不一致。请在项目根目录执行{" "}
+                <code className="rounded bg-gray-100 px-1 py-0.5">pnpm run db:ensure-schema</code>{" "}
+                补齐列后重启 dev，再刷新本页。
+              </p>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="mt-4"
+                onClick={() => refetch()}
+              >
+                重试
+              </Button>
+            </div>
           ) : data?.items.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-64 text-gray-400">
+            <div className="flex flex-col items-center justify-center h-64 text-gray-400 px-6 text-center">
               <Newspaper className="h-12 w-12 mb-3 opacity-30" />
               <p className="text-sm">暂无符合条件的资讯</p>
+              {listCategory === "report" ? (
+                <p className="text-xs text-gray-400 mt-2 max-w-sm leading-relaxed">
+                  「报告」仅展示手工上传的文档；Preqin / Pitchbook 等站点抓取的内容在「资讯」标签下。
+                </p>
+              ) : null}
             </div>
           ) : (
             <div className="p-4 space-y-2">
@@ -576,12 +591,6 @@ export default function News() {
         )}
       </div>
 
-      {/* AI Bot Panel */}
-      {showBot && (
-        <div className="w-[380px] border-l border-gray-200 bg-white flex flex-col shrink-0">
-          <NewsBot onClose={() => setShowBot(false)} />
-        </div>
-      )}
     </div>
   );
 }

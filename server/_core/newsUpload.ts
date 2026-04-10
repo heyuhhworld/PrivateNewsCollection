@@ -189,9 +189,13 @@ export function registerNewsUploadRoutes(app: Express) {
 
       const ext = normalizeExtension(file.originalname);
       let extracted: string;
+      let extractedLinePageMap: number[] | null = null;
       try {
         const buf = fs.readFileSync(file.path);
-        extracted = await extractTextFromFile(buf, file.mimetype, ext);
+        const ex = await extractTextFromFile(buf, file.mimetype, ext);
+        extracted = ex.text;
+        extractedLinePageMap =
+          ex.linePageMap && ex.linePageMap.length > 0 ? ex.linePageMap : null;
       } catch (e: any) {
         fs.unlink(file.path, () => {});
         res.status(400).json({ error: e?.message ?? "文本提取失败" });
@@ -245,6 +249,7 @@ export function registerNewsUploadRoutes(app: Express) {
           attachmentOriginalName: file.originalname,
           effectivePeriodLabel: meta.effectivePeriodLabel as string,
           extractedText: extracted,
+          extractedLinePageMap,
         });
 
         const row = await db
