@@ -1,7 +1,8 @@
-import { and, desc, eq, gte, like, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, like, lte, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
   InsertUser,
+  aiBriefings,
   chatMessages,
   InsertChatMessage,
   newsArticles,
@@ -12,6 +13,15 @@ import {
   InsertCrawlJob,
   crawlLogs,
   InsertCrawlLog,
+  entities,
+  InsertEntity,
+  entityArticles,
+  entityRelations,
+  InsertEntityRelation,
+  tagCorrections,
+  InsertTagCorrection,
+  briefingSubscriptions,
+  InsertBriefingSubscription,
   type NewsArticle,
 } from "../drizzle/schema";
 import { ENV } from "./_core/env";
@@ -164,6 +174,7 @@ export async function getNewsArticles(filter: NewsFilter = {}) {
     source,
     strategy,
     region,
+    tag,
     keyword,
     dateFrom,
     dateTo,
@@ -177,6 +188,11 @@ export async function getNewsArticles(filter: NewsFilter = {}) {
   if (source) conditions.push(eq(newsArticles.source, source));
   if (strategy) conditions.push(eq(newsArticles.strategy, strategy as any));
   if (region) conditions.push(eq(newsArticles.region, region as any));
+  if (tag?.trim()) {
+    conditions.push(
+      sql`JSON_CONTAINS(${newsArticles.tags}, ${JSON.stringify(tag.trim())})`
+    );
+  }
   if (recordCategory) conditions.push(eq(newsArticles.recordCategory, recordCategory));
   if (keyword) {
     const kwExpr = or(
@@ -238,13 +254,86 @@ export async function incrementArticleViewCount(id: number) {
   }
 }
 
+export async function updateNewsArticleEmbedding(id: number, embedding: number[]) {
+  const db = await getDb();
+  if (!db) return;
+  try {
+    await db.update(newsArticles).set({ embedding }).where(eq(newsArticles.id, id));
+  } catch (e) {
+    console.warn("[updateNewsArticleEmbedding]", e);
+  }
+}
+
+/** 用于语义检索：可见且已有 embedding 的资讯，按发布时间新到旧 */
+export async function listNewsArticlesWithEmbeddings(limit: number): Promise<NewsArticle[]> {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(newsArticles)
+    .where(and(eq(newsArticles.isHidden, false), isNotNull(newsArticles.embedding)))
+    .orderBy(desc(newsArticles.publishedAt))
+    .limit(Math.min(limit, 8000));
+}
+
+export async function getNewsArticlesByIds(ids: number[]): Promise<NewsArticle[]> {
+  if (ids.length === 0) return [];
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(newsArticles)
+    .where(and(eq(newsArticles.isHidden, false), inArray(newsArticles.id, ids)));
+}
+
+export async function insertAiBriefing(body: string) {
+  const db = await getDb();
+  if (!db) return null;
+  await db.insert(aiBriefings).values({ body });
+  const row = await db
+    .select()
+    .from(aiBriefings)
+    .orderBy(desc(aiBriefings.id))
+    .limit(1);
+  return row[0] ?? null;
+}
+
+export async function getLatestAiBriefing() {
+  const db = await getDb();
+  if (!db) return null;
+  const row = await db
+    .select()
+    .from(aiBriefings)
+    .orderBy(desc(aiBriefings.id))
+    .limit(1);
+  return row[0] ?? null;
+}
+
+export async function listRecentNewsArticlesSince(since: Date, limit: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(newsArticles)
+    .where(
+      and(eq(newsArticles.isHidden, false), gte(newsArticles.createdAt, since))
+    )
+    .orderBy(desc(newsArticles.publishedAt))
+    .limit(limit);
+}
+
+export type AdminNewsArticleListItem = NewsArticle & {
+  uploaderName: string | null;
+  uploaderEmail: string | null;
+};
+
 export async function adminListNewsArticles(opts: {
   page?: number;
   pageSize?: number;
   visibility?: "all" | "visible" | "hidden";
-}) {
+}): Promise<{ items: AdminNewsArticleListItem[]; total: number }> {
   const db = await getDb();
-  if (!db) return { items: [] as NewsArticle[], total: 0 };
+  if (!db) return { items: [], total: 0 };
   const page = opts.page ?? 1;
   const pageSize = Math.min(opts.pageSize ?? 30, 100);
   const conditions = [];
@@ -266,7 +355,34 @@ export async function adminListNewsArticles(opts: {
       .where(where),
   ]);
 
-  return { items, total: Number(countResult[0]?.count ?? 0) };
+  const uploaderIds = Array.from(
+    new Set(
+      items
+        .map((a) => a.uploaderUserId)
+        .filter((id): id is number => typeof id === "number" && id > 0)
+    )
+  );
+  let uploaderMap = new Map<number, { name: string | null; email: string | null }>();
+  if (uploaderIds.length > 0) {
+    const uploaders = await db
+      .select({ id: users.id, name: users.name, email: users.email })
+      .from(users)
+      .where(inArray(users.id, uploaderIds));
+    uploaderMap = new Map(
+      uploaders.map((u) => [u.id, { name: u.name ?? null, email: u.email ?? null }])
+    );
+  }
+
+  const enriched: AdminNewsArticleListItem[] = items.map((a) => {
+    const u = a.uploaderUserId != null ? uploaderMap.get(a.uploaderUserId) : undefined;
+    return {
+      ...a,
+      uploaderName: u?.name ?? null,
+      uploaderEmail: u?.email ?? null,
+    };
+  });
+
+  return { items: enriched, total: Number(countResult[0]?.count ?? 0) };
 }
 
 export async function adminSetNewsArticleHidden(id: number, isHidden: boolean) {
@@ -414,4 +530,186 @@ export async function saveChatMessage(msg: InsertChatMessage) {
   const db = await getDb();
   if (!db) return;
   await db.insert(chatMessages).values(msg);
+}
+
+// ─── Entities (Knowledge Graph) ─────────────────────────────────────────────
+
+export async function upsertEntity(data: {
+  name: string;
+  type: "fund" | "institution" | "person" | "other";
+  aliases?: string[] | null;
+}): Promise<number | null> {
+  const db = await getDb();
+  if (!db) return null;
+  const existing = await db
+    .select()
+    .from(entities)
+    .where(eq(entities.name, data.name))
+    .limit(1);
+  if (existing.length > 0) return existing[0].id;
+  await db.insert(entities).values({
+    name: data.name,
+    type: data.type,
+    aliases: data.aliases ?? null,
+  });
+  const row = await db
+    .select({ id: entities.id })
+    .from(entities)
+    .where(eq(entities.name, data.name))
+    .limit(1);
+  return row[0]?.id ?? null;
+}
+
+export async function linkEntityToArticle(
+  entityId: number,
+  articleId: number
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  const existing = await db
+    .select()
+    .from(entityArticles)
+    .where(
+      and(
+        eq(entityArticles.entityId, entityId),
+        eq(entityArticles.articleId, articleId)
+      )
+    )
+    .limit(1);
+  if (existing.length > 0) return;
+  await db.insert(entityArticles).values({ entityId, articleId });
+}
+
+export async function upsertEntityRelation(
+  data: InsertEntityRelation
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  const existing = await db
+    .select()
+    .from(entityRelations)
+    .where(
+      and(
+        eq(entityRelations.sourceEntityId, data.sourceEntityId),
+        eq(entityRelations.targetEntityId, data.targetEntityId),
+        eq(entityRelations.relationType, data.relationType)
+      )
+    )
+    .limit(1);
+  if (existing.length > 0) return;
+  await db.insert(entityRelations).values(data);
+}
+
+export async function getAllEntities() {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(entities).orderBy(desc(entities.createdAt)).limit(2000);
+}
+
+export async function getAllEntityRelations() {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(entityRelations)
+    .orderBy(desc(entityRelations.createdAt))
+    .limit(5000);
+}
+
+export async function getEntityArticleLinks(entityId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(entityArticles)
+    .where(eq(entityArticles.entityId, entityId));
+}
+
+export async function getArticleEntityIds(articleId: number): Promise<number[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db
+    .select({ entityId: entityArticles.entityId })
+    .from(entityArticles)
+    .where(eq(entityArticles.articleId, articleId));
+  return rows.map((r) => r.entityId);
+}
+
+export async function getEntitiesByIds(ids: number[]) {
+  if (ids.length === 0) return [];
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(entities).where(inArray(entities.id, ids));
+}
+
+// ─── Tag Corrections ────────────────────────────────────────────────────────
+
+export async function insertTagCorrection(
+  data: InsertTagCorrection
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.insert(tagCorrections).values(data);
+}
+
+export async function getRecentTagCorrections(limit = 30) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(tagCorrections)
+    .orderBy(desc(tagCorrections.createdAt))
+    .limit(limit);
+}
+
+export async function updateArticleTags(
+  id: number,
+  data: {
+    tags?: string[];
+    strategy?: string | null;
+    region?: string | null;
+  }
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  const set: Record<string, unknown> = {};
+  if (data.tags !== undefined) set.tags = data.tags;
+  if (data.strategy !== undefined) set.strategy = data.strategy;
+  if (data.region !== undefined) set.region = data.region;
+  if (Object.keys(set).length === 0) return;
+  await db.update(newsArticles).set(set).where(eq(newsArticles.id, id));
+}
+
+// ─── Briefing Subscriptions ─────────────────────────────────────────────────
+
+export async function listBriefingSubscriptions() {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(briefingSubscriptions).orderBy(desc(briefingSubscriptions.createdAt));
+}
+
+export async function addBriefingSubscription(
+  data: InsertBriefingSubscription
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.insert(briefingSubscriptions).values(data);
+}
+
+export async function removeBriefingSubscription(id: number): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(briefingSubscriptions).where(eq(briefingSubscriptions.id, id));
+}
+
+export async function toggleBriefingSubscription(
+  id: number,
+  isEnabled: boolean
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db
+    .update(briefingSubscriptions)
+    .set({ isEnabled })
+    .where(eq(briefingSubscriptions.id, id));
 }

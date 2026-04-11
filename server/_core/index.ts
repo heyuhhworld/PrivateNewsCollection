@@ -6,6 +6,8 @@ import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "./oauth";
 import { registerNewsUploadRoutes } from "./newsUpload";
+import { registerChatStreamRoute } from "./chatStreamRoute";
+import { startScheduler } from "./scheduler";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
@@ -47,6 +49,7 @@ async function startServer() {
   );
   app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
   registerNewsUploadRoutes(app);
+  registerChatStreamRoute(app);
   // development mode uses Vite, production mode uses static files
   if (process.env.NODE_ENV === "development") {
     await setupVite(app, server);
@@ -63,6 +66,7 @@ async function startServer() {
 
   server.listen(port, () => {
     console.log(`Server running on http://localhost:${port}/`);
+    startScheduler();
   });
 }
 

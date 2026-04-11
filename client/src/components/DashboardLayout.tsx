@@ -26,12 +26,14 @@ import { useIsMobile } from "@/hooks/useMobile";
 import {
   MessageCircle,
   Minimize2,
+  Network,
   Newspaper,
   ChevronDown,
   LogOut,
   PanelLeft,
   Settings,
   ShieldCheck,
+  Sparkles,
 } from "lucide-react";
 import { CSSProperties, useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
@@ -42,6 +44,8 @@ import NewsBot from "./NewsBot";
 
 const menuItems = [
   { icon: Newspaper, label: "资讯", path: "/news", beta: true },
+  { icon: Sparkles, label: "每日简报", path: "/briefing" },
+  { icon: Network, label: "知识图谱", path: "/knowledge-graph" },
   { icon: Settings, label: "系统管理", path: "/system" },
 ];
 
@@ -61,7 +65,7 @@ export default function DashboardLayout({
   });
   const { loading, user } = useAuth();
   const utils = trpc.useUtils();
-  const [authMode, setAuthMode] = useState<"login" | "register" | "changePassword">("login");
+  const [authMode, setAuthMode] = useState<"login" | "register" | "resetPassword">("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
@@ -79,12 +83,12 @@ export default function DashboardLayout({
       window.location.href = "/news";
     },
   });
-  const emailChangePasswordMutation = trpc.auth.emailChangePassword.useMutation();
+  const emailResetPasswordMutation = trpc.auth.emailResetPassword.useMutation();
 
   const isAuthPending =
     emailLoginMutation.isPending ||
     emailRegisterMutation.isPending ||
-    emailChangePasswordMutation.isPending;
+    emailResetPasswordMutation.isPending;
 
   useEffect(() => {
     localStorage.setItem(SIDEBAR_WIDTH_KEY, sidebarWidth.toString());
@@ -104,17 +108,16 @@ export default function DashboardLayout({
             password,
           });
           toast.success("注册成功，已自动登录");
-        } else if (authMode === "changePassword") {
+        } else if (authMode === "resetPassword") {
           if (newPassword !== confirmNewPassword) {
             toast.error("两次输入的新密码不一致");
             return;
           }
-          await emailChangePasswordMutation.mutateAsync({
+          await emailResetPasswordMutation.mutateAsync({
             email,
-            currentPassword: password,
             newPassword,
           });
-          toast.success("密码已更新，请使用新密码登录");
+          toast.success("密码已重置，请使用新密码登录");
           setAuthMode("login");
           setPassword("");
           setNewPassword("");
@@ -170,10 +173,10 @@ export default function DashboardLayout({
               </button>
               <button
                 type="button"
-                onClick={() => setAuthMode("changePassword")}
-                className={`h-8 text-xs sm:text-sm rounded-md ${authMode === "changePassword" ? "bg-white text-[#1677ff] shadow-sm" : "text-gray-500"}`}
+                onClick={() => setAuthMode("resetPassword")}
+                className={`h-8 text-xs sm:text-sm rounded-md ${authMode === "resetPassword" ? "bg-white text-[#1677ff] shadow-sm" : "text-gray-500"}`}
               >
-                改密码
+                重置密码
               </button>
             </div>
             {authMode === "register" && (
@@ -191,18 +194,20 @@ export default function DashboardLayout({
               onChange={(e) => setEmail(e.target.value)}
               className="h-10"
             />
-            <Input
-              type="password"
-              placeholder={
-                authMode === "changePassword" ? "当前密码" : "密码（至少 8 位）"
-              }
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="h-10"
-              autoComplete={authMode === "changePassword" ? "current-password" : undefined}
-            />
-            {authMode === "changePassword" && (
+            {authMode !== "resetPassword" && (
+              <Input
+                type="password"
+                placeholder="密码（至少 8 位）"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="h-10"
+              />
+            )}
+            {authMode === "resetPassword" && (
               <>
+                <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 leading-relaxed">
+                  无需原密码即可重置。请仅在可信网络使用；公网部署存在账号被他人改密风险。
+                </p>
                 <Input
                   type="password"
                   placeholder="新密码（至少 8 位）"
@@ -226,9 +231,9 @@ export default function DashboardLayout({
               disabled={
                 isAuthPending ||
                 !email.trim() ||
-                !password.trim() ||
+                (authMode !== "resetPassword" && !password.trim()) ||
                 (authMode === "register" && !name.trim()) ||
-                (authMode === "changePassword" &&
+                (authMode === "resetPassword" &&
                   (!newPassword.trim() ||
                     !confirmNewPassword.trim() ||
                     newPassword.length < 8))
@@ -240,8 +245,8 @@ export default function DashboardLayout({
                 ? "提交中..."
                 : authMode === "register"
                   ? "注册并登录"
-                  : authMode === "changePassword"
-                    ? "更新密码"
+                  : authMode === "resetPassword"
+                    ? "重置密码"
                     : "登录"}
             </Button>
             <div className="pt-1 border-t border-gray-100">

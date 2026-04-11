@@ -5,6 +5,14 @@ import { extractArticleFromHtml } from "../_core/articleExtract";
 import { fetchHtmlForArticleImport } from "../_core/fetchImportUrl";
 import { getImportSessionStatus } from "../_core/importSessionStorage";
 import { invokeLLM } from "../_core/llm";
+import { scheduleArticleEmbedding, buildArticleEmbeddingInput } from "../_core/articleEmbedding";
+import { scheduleEntityExtraction } from "../_core/entityExtraction";
+import { buildTagCorrectionContext } from "../_core/tagLearning";
+import { dateRangeFromPreset, parseNewsSearchIntent } from "../_core/intentParser";
+import {
+  recommendByEmbeddingCentroid,
+  semanticSearchArticles,
+} from "../_core/semanticSearch";
 import {
   getNewsArticles,
   getNewsArticleById,
@@ -18,6 +26,11 @@ import {
   adminSetNewsArticleHidden,
   adminDeleteNewsArticle,
   incrementArticleViewCount,
+  getNewsArticlesByIds,
+  insertTagCorrection,
+  updateArticleTags,
+  getArticleEntityIds,
+  getEntitiesByIds,
 } from "../db";
 import { getDb, getDbUnavailableHint } from "../db";
 import { newsArticles } from "../../drizzle/schema";
@@ -170,11 +183,12 @@ export async function importSingleArticle(
 
   // ── Step 4: LLM 仅生成摘要与元数据（不生成正文） ─────────────────────────
   try {
+    const tagContext = await buildTagCorrectionContext(20);
     const llmResponse = await invokeLLM({
       messages: [
         {
           role: "system",
-          content: `你是金融资讯编辑助手。下面「正文摘录」是唯一事实来源。你只能撰写简短中文摘要与分类标签，不得编造正文未出现的数据、引语、结论或细节。禁止输出正文全文。禁止把摘要写成评论文章。`,
+          content: `你是金融资讯编辑助手。下面「正文摘录」是唯一事实来源。你只能撰写简短中文摘要与分类标签，不得编造正文未出现的数据、引语、结论或细节。禁止输出正文全文。禁止把摘要写成评论文章。${tagContext ? "\n\n" + tagContext : ""}`,
         },
         {
           role: "user",
@@ -313,6 +327,16 @@ ${bodyForLlm}
       recordCategory: "news",
       isHidden: false,
     });
+
+    const insertedRow = await db
+      .select({ id: newsArticles.id })
+      .from(newsArticles)
+      .where(eq(newsArticles.originalUrl, url))
+      .limit(1);
+    if (insertedRow[0]?.id) {
+      scheduleArticleEmbedding(insertedRow[0].id);
+      scheduleEntityExtraction(insertedRow[0].id);
+    }
 
     console.log(`[Import] Imported: ${titleFinal}`);
     return { status: "success", title: titleFinal };
@@ -503,6 +527,116 @@ export const newsRouter = router({
         });
     }),
 
+  /** 自然语言解析筛选 + 列表（或纯语义结果） */
+  smartSearch: publicProcedure
+    .input(z.object({ query: z.string().min(1).max(500) }))
+    .mutation(async ({ input }) => {
+      const intent = await parseNewsSearchIntent(input.query);
+      if (intent.semanticOnly) {
+        const items = await semanticSearchArticles(input.query, {
+          limit: 30,
+          fallbackKeyword: true,
+        });
+        return {
+          intent,
+          semanticOnly: true as const,
+          items,
+          total: items.length,
+        };
+      }
+      const dr = dateRangeFromPreset(intent.datePreset ?? undefined);
+      const { items, total } = await getNewsArticles({
+        keyword: intent.keyword ?? undefined,
+        source: intent.source ?? undefined,
+        strategy: intent.strategy ?? undefined,
+        region: intent.region ?? undefined,
+        recordCategory: intent.recordCategory ?? undefined,
+        dateFrom: dr.dateFrom,
+        dateTo: dr.dateTo,
+        page: 1,
+        pageSize: 30,
+      });
+      return { intent, semanticOnly: false as const, items, total };
+    }),
+
+  /** 基于收藏 embedding 均值的个性化推荐；无向量则热度 */
+  recommend: publicProcedure
+    .input(z.object({ sessionId: z.string().optional() }))
+    .query(async ({ input, ctx }) => {
+      const userId = ctx.user?.id;
+      const bookmarkList = await getBookmarks(userId, input.sessionId);
+      const ids = bookmarkList.map((b) => b.articleId).slice(0, 12);
+      if (ids.length === 0) {
+        const { items } = await getNewsArticles({
+          sortBy: "hot_desc",
+          pageSize: 5,
+        });
+        return { mode: "hot" as const, items };
+      }
+      const byIds = await getNewsArticlesByIds(ids);
+      const seeds = byIds.filter(
+        (a) => Array.isArray(a.embedding) && (a.embedding as number[]).length > 0
+      );
+      if (seeds.length === 0) {
+        const { items } = await getNewsArticles({
+          sortBy: "hot_desc",
+          pageSize: 5,
+        });
+        return { mode: "hot" as const, items };
+      }
+      const items = await recommendByEmbeddingCentroid(seeds, {
+        limit: 5,
+        excludeIds: ids,
+      });
+      return { mode: "personalized" as const, items };
+    }),
+
+  /** 详情页：相关语义文章 + AI 对比洞察 */
+  relatedInsight: publicProcedure
+    .input(z.object({ id: z.number().int() }))
+    .query(async ({ input, ctx }) => {
+      const doc = await getNewsArticleById(input.id);
+      if (!doc) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "资讯不存在" });
+      }
+      if (doc.isHidden && ctx.user?.role !== "admin") {
+        throw new TRPCError({ code: "NOT_FOUND", message: "资讯不存在" });
+      }
+      const q = buildArticleEmbeddingInput(doc);
+      let related = await semanticSearchArticles(q, {
+        limit: 8,
+        excludeIds: [doc.id],
+        fallbackKeyword: true,
+      });
+      related = related.filter((r) => r.id !== doc.id).slice(0, 5);
+      if (related.length === 0) {
+        return { markdown: "", related: [] as typeof related };
+      }
+      const brief = related
+        .map(
+          (r) =>
+            `[id=${r.id}] ${r.title} | ${r.source}\n${(r.summary ?? "—").slice(0, 220)}`
+        )
+        .join("\n\n");
+      const resp = await invokeLLM({
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是卖方研究风格的助手。请用中文 Markdown 输出简短「跨文档洞察」：与主文相比，相关报道补充了哪些视角、有何异同或趋势。不得编造列表外事实。无结论可说数据不足。",
+          },
+          {
+            role: "user",
+            content: `【主文】${doc.title}\n摘要：${doc.summary ?? "—"}\n\n【库内相关资讯】\n${brief}`,
+          },
+        ],
+      });
+      const raw = resp.choices?.[0]?.message?.content;
+      const markdown =
+        typeof raw === "string" ? raw.trim() : "";
+      return { markdown, related };
+    }),
+
   /** 后台：资讯记录清单（含已隐藏） */
   adminArticleList: adminProcedure
     .input(
@@ -526,5 +660,66 @@ export const newsRouter = router({
     .mutation(async ({ input }) => {
       await adminDeleteNewsArticle(input.id);
       return { success: true };
+    }),
+
+  /** 用户修正标签/策略/地区 */
+  correctTags: publicProcedure
+    .input(
+      z.object({
+        articleId: z.number().int(),
+        tags: z.array(z.string()).optional(),
+        strategy: z.string().nullable().optional(),
+        region: z.string().nullable().optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const article = await getNewsArticleById(input.articleId);
+      if (!article) throw new TRPCError({ code: "NOT_FOUND", message: "文章不存在" });
+      const userId = ctx.user?.id ?? null;
+
+      if (input.tags !== undefined) {
+        await insertTagCorrection({
+          articleId: input.articleId,
+          userId,
+          fieldName: "tags",
+          oldValue: JSON.stringify(article.tags ?? []),
+          newValue: JSON.stringify(input.tags),
+        });
+      }
+      if (input.strategy !== undefined) {
+        await insertTagCorrection({
+          articleId: input.articleId,
+          userId,
+          fieldName: "strategy",
+          oldValue: article.strategy ?? null,
+          newValue: input.strategy,
+        });
+      }
+      if (input.region !== undefined) {
+        await insertTagCorrection({
+          articleId: input.articleId,
+          userId,
+          fieldName: "region",
+          oldValue: article.region ?? null,
+          newValue: input.region,
+        });
+      }
+
+      await updateArticleTags(input.articleId, {
+        tags: input.tags,
+        strategy: input.strategy,
+        region: input.region,
+      });
+
+      return { success: true };
+    }),
+
+  /** 获取文章关联的实体 */
+  articleEntities: publicProcedure
+    .input(z.object({ articleId: z.number().int() }))
+    .query(async ({ input }) => {
+      const ids = await getArticleEntityIds(input.articleId);
+      if (ids.length === 0) return [];
+      return getEntitiesByIds(ids);
     }),
 });

@@ -10,6 +10,8 @@ import NewsDetail from "./pages/NewsDetail";
 import Projects from "./pages/Projects";
 import PlaceholderPage from "./pages/PlaceholderPage";
 import SystemManagement from "./pages/SystemManagement";
+import Briefing from "./pages/Briefing";
+import KnowledgeGraph from "./pages/KnowledgeGraph";
 import {
   BarChart3,
   Building2,
@@ -36,6 +38,18 @@ function Router() {
       <Route path="/news">
         <DashboardLayout>
           <News />
+        </DashboardLayout>
+      </Route>
+
+      <Route path="/briefing">
+        <DashboardLayout>
+          <Briefing />
+        </DashboardLayout>
+      </Route>
+
+      <Route path="/knowledge-graph">
+        <DashboardLayout>
+          <KnowledgeGraph />
         </DashboardLayout>
       </Route>
 

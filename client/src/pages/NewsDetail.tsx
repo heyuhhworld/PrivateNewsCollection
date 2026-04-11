@@ -9,15 +9,21 @@ import {
   Bookmark,
   BookmarkCheck,
   Calendar,
+  Check,
   ExternalLink,
   Globe,
+  Network,
   Newspaper,
+  Pencil,
   User,
   GripVertical,
   PanelRightClose,
   PanelRightOpen,
+  Sparkles,
   Upload,
+  X,
 } from "lucide-react";
+import { Streamdown } from "streamdown";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
 import { cn } from "@/lib/utils";
@@ -101,6 +107,32 @@ export default function NewsDetail() {
     { id },
     { enabled: id > 0 }
   );
+
+  const { data: relatedInsight } = trpc.news.relatedInsight.useQuery(
+    { id },
+    { enabled: id > 0 && !!article }
+  );
+
+  const { data: articleEntities } = trpc.news.articleEntities.useQuery(
+    { articleId: id },
+    { enabled: id > 0 }
+  );
+
+  const utils = trpc.useUtils();
+  const correctTagsMutation = trpc.news.correctTags.useMutation({
+    onSuccess: () => {
+      toast.success("标签已更新");
+      utils.news.detail.invalidate({ id });
+      setEditingTags(false);
+    },
+    onError: (e) => toast.error(e.message),
+  });
+
+  const [editingTags, setEditingTags] = useState(false);
+  const [editTags, setEditTags] = useState<string[]>([]);
+  const [editStrategy, setEditStrategy] = useState<string | null>(null);
+  const [editRegion, setEditRegion] = useState<string | null>(null);
+  const [newTag, setNewTag] = useState("");
 
   const { data: bookmarked, refetch: refetchBookmark } =
     trpc.news.isBookmarked.useQuery(
@@ -438,6 +470,45 @@ export default function NewsDetail() {
                 暂无导读内容
               </div>
             )}
+
+          {(relatedInsight?.markdown ||
+            (relatedInsight?.related && relatedInsight.related.length > 0)) && (
+            <div className="bg-white rounded-xl border border-violet-100 shadow-sm overflow-hidden">
+              <div className="px-5 py-3 border-b border-violet-50 bg-violet-50/50 flex items-center gap-2">
+                <Sparkles className="h-4 w-4 text-violet-600 shrink-0" />
+                <h2 className="text-sm font-semibold text-violet-900">跨文档洞察</h2>
+                <span className="text-[11px] text-violet-600/80">
+                  基于库内语义相关报道由 AI 生成
+                </span>
+              </div>
+              <div className="px-5 py-4 space-y-4">
+                {relatedInsight.markdown ? (
+                  <div className="prose prose-sm max-w-none text-gray-800 [&_a]:text-[#1677ff]">
+                    <Streamdown>{relatedInsight.markdown}</Streamdown>
+                  </div>
+                ) : null}
+                {relatedInsight.related && relatedInsight.related.length > 0 && (
+                  <div>
+                    <p className="text-xs font-medium text-gray-500 mb-2">相关资讯</p>
+                    <ul className="space-y-1.5">
+                      {relatedInsight.related.map((r) => (
+                        <li key={r.id}>
+                          <button
+                            type="button"
+                            className="text-left text-sm text-[#1677ff] hover:underline"
+                            onClick={() => setLocation(`/news/${r.id}`)}
+                          >
+                            {r.title}
+                          </button>
+                          <span className="text-xs text-gray-400 ml-2">{r.source}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </>
       )}
 
@@ -691,16 +762,159 @@ export default function NewsDetail() {
             )}
           </div>
 
-          {/* Tags */}
-          {tags.length > 0 && (
-            <div className="flex items-center gap-1.5 flex-wrap mt-4 pt-4 border-t border-gray-50">
-              {tags.map((tag) => (
-                <span
-                  key={tag}
-                  className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600 border border-gray-200"
+          {/* Tags — view / edit */}
+          <div className="mt-4 pt-4 border-t border-gray-50">
+            {!editingTags ? (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {tags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600 border border-gray-200"
+                  >
+                    {tag}
+                  </span>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditTags([...(article.tags as string[] ?? [])]);
+                    setEditStrategy(article.strategy ?? null);
+                    setEditRegion(article.region ?? null);
+                    setEditingTags(true);
+                  }}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] text-gray-400 hover:text-[#1677ff] hover:bg-blue-50 border border-dashed border-gray-200 transition-colors"
+                  title="编辑标签"
                 >
-                  {tag}
-                </span>
+                  <Pencil className="h-3 w-3" />
+                  修正标签
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-3 bg-blue-50/40 rounded-lg p-3 border border-blue-100">
+                <p className="text-[11px] text-blue-600 font-medium">
+                  修正标签、策略、地区 — 修改将反馈到 AI 分类学习
+                </p>
+                {/* tags */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {editTags.map((tag) => (
+                    <span
+                      key={tag}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-white text-gray-700 border border-gray-200"
+                    >
+                      {tag}
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setEditTags((t) => t.filter((x) => x !== tag))
+                        }
+                        className="text-gray-400 hover:text-red-500"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </span>
+                  ))}
+                  <div className="inline-flex items-center gap-1">
+                    <input
+                      value={newTag}
+                      onChange={(e) => setNewTag(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && newTag.trim()) {
+                          setEditTags((t) =>
+                            t.includes(newTag.trim()) ? t : [...t, newTag.trim()]
+                          );
+                          setNewTag("");
+                        }
+                      }}
+                      placeholder="新标签…"
+                      className="w-20 h-6 text-xs border border-gray-200 rounded px-1.5 bg-white focus:outline-none focus:ring-1 focus:ring-blue-300"
+                    />
+                  </div>
+                </div>
+                {/* strategy & region selects */}
+                <div className="flex gap-3 flex-wrap text-xs">
+                  <label className="flex items-center gap-1 text-gray-600">
+                    策略
+                    <select
+                      value={editStrategy ?? ""}
+                      onChange={(e) =>
+                        setEditStrategy(e.target.value || null)
+                      }
+                      className="h-7 rounded border border-gray-200 bg-white px-1.5 text-xs"
+                    >
+                      <option value="">无</option>
+                      {["私募股权","风险投资","房地产","信贷","基础设施","对冲基金","母基金","并购","成长股权","其他"].map((s) => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="flex items-center gap-1 text-gray-600">
+                    地区
+                    <select
+                      value={editRegion ?? ""}
+                      onChange={(e) =>
+                        setEditRegion(e.target.value || null)
+                      }
+                      className="h-7 rounded border border-gray-200 bg-white px-1.5 text-xs"
+                    >
+                      <option value="">无</option>
+                      {["全球","亚太","北美","欧洲","中国","东南亚","中东","其他"].map((r) => (
+                        <option key={r} value={r}>{r}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    className="h-7 text-xs bg-[#1677ff] hover:bg-[#0958d9] gap-1"
+                    disabled={correctTagsMutation.isPending}
+                    onClick={() =>
+                      correctTagsMutation.mutate({
+                        articleId: id,
+                        tags: editTags,
+                        strategy: editStrategy,
+                        region: editRegion,
+                      })
+                    }
+                  >
+                    <Check className="h-3 w-3" />
+                    保存
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={() => setEditingTags(false)}
+                  >
+                    取消
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Entities (Knowledge Graph) */}
+          {articleEntities && articleEntities.length > 0 && (
+            <div className="mt-3 pt-3 border-t border-gray-50 flex items-center gap-1.5 flex-wrap">
+              <Network className="h-3.5 w-3.5 text-indigo-400 shrink-0" />
+              {articleEntities.map((ent) => (
+                <button
+                  key={ent.id}
+                  type="button"
+                  onClick={() => setLocation(`/knowledge-graph`)}
+                  className={cn(
+                    "inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium border transition-colors hover:ring-1 hover:ring-indigo-200",
+                    ent.type === "fund"
+                      ? "bg-indigo-50 text-indigo-700 border-indigo-200"
+                      : ent.type === "institution"
+                        ? "bg-sky-50 text-sky-700 border-sky-200"
+                        : ent.type === "person"
+                          ? "bg-amber-50 text-amber-700 border-amber-200"
+                          : "bg-gray-50 text-gray-600 border-gray-200"
+                  )}
+                >
+                  {ent.name}
+                </button>
               ))}
             </div>
           )}

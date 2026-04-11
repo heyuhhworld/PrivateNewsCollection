@@ -11,6 +11,20 @@ vi.mock("./db", () => ({
   saveChatMessage: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock("./_core/semanticSearch", () => ({
+  semanticSearchArticles: vi.fn().mockResolvedValue([
+    {
+      id: 1,
+      title: "测试资讯",
+      summary: "摘要",
+      content: "正文内容用于上下文",
+      source: "Manual",
+      publishedAt: new Date("2024-01-01"),
+      isHidden: false,
+    },
+  ]),
+}));
+
 // Mock LLM
 vi.mock("./_core/llm", () => ({
   invokeLLM: vi.fn().mockResolvedValue({

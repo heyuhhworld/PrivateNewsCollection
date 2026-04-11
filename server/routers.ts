@@ -9,6 +9,8 @@ import { getUserByEmail, upsertUser } from "./db";
 import { newsRouter } from "./routers/news";
 import { chatRouter } from "./routers/chat";
 import { crawlRouter } from "./routers/crawl";
+import { briefingRouter } from "./routers/briefing";
+import { knowledgeGraphRouter } from "./routers/knowledgeGraph";
 
 export const appRouter = router({
   system: systemRouter,
@@ -75,23 +77,19 @@ export const appRouter = router({
         ctx.res.cookie(COOKIE_NAME, sessionToken, { ...cookieOptions });
         return { success: true } as const;
       }),
-    /** 未登录时凭邮箱 + 当前密码修改（与登录校验一致，防枚举用统一错误文案） */
-    emailChangePassword: publicProcedure
+    /** 直接重置邮箱账号密码（不校验原密码）；仅建议在可信/内网环境使用 */
+    emailResetPassword: publicProcedure
       .input(
         z.object({
           email: z.string().email(),
-          currentPassword: z.string().min(1).max(128),
           newPassword: z.string().min(8).max(128),
         })
       )
       .mutation(async ({ input }) => {
         const email = normalizeEmail(input.email);
         const user = await getUserByEmail(email);
-        if (!user || !user.passwordHash) {
-          throw new Error("邮箱或当前密码不正确");
-        }
-        if (!verifyPassword(input.currentPassword, user.passwordHash)) {
-          throw new Error("邮箱或当前密码不正确");
+        if (!user) {
+          throw new Error("该邮箱未注册");
         }
         await upsertUser({
           openId: user.openId,
@@ -110,6 +108,8 @@ export const appRouter = router({
   news: newsRouter,
   chat: chatRouter,
   crawl: crawlRouter,
+  briefing: briefingRouter,
+  kg: knowledgeGraphRouter,
 });
 
 export type AppRouter = typeof appRouter;

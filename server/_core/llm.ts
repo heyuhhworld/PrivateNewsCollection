@@ -27,9 +27,10 @@ export type MessageContent = string | TextContent | ImageContent | FileContent;
 
 export type Message = {
   role: Role;
-  content: MessageContent | MessageContent[];
+  content: MessageContent | MessageContent[] | null;
   name?: string;
   tool_call_id?: string;
+  tool_calls?: ToolCall[];
 };
 
 export type Tool = {
@@ -136,11 +137,11 @@ const normalizeContentPart = (
   throw new Error("Unsupported message content part");
 };
 
-const normalizeMessage = (message: Message) => {
-  const { role, name, tool_call_id } = message;
+const normalizeMessage = (message: Message): Record<string, unknown> => {
+  const { role, name, tool_call_id, tool_calls } = message;
 
   if (role === "tool" || role === "function") {
-    const content = ensureArray(message.content)
+    const content = ensureArray(message.content ?? "")
       .map(part => (typeof part === "string" ? part : JSON.stringify(part)))
       .join("\n");
 
@@ -152,22 +153,30 @@ const normalizeMessage = (message: Message) => {
     };
   }
 
-  const contentParts = ensureArray(message.content).map(normalizeContentPart);
+  const rawContent = message.content;
+  if (rawContent == null && tool_calls?.length) {
+    return { role, name, content: null, tool_calls };
+  }
+  const contentParts = ensureArray(rawContent ?? "").map(normalizeContentPart);
 
   // If there's only text content, collapse to a single string for compatibility
   if (contentParts.length === 1 && contentParts[0].type === "text") {
-    return {
+    const out: Record<string, unknown> = {
       role,
       name,
       content: contentParts[0].text,
     };
+    if (tool_calls?.length) out.tool_calls = tool_calls;
+    return out;
   }
 
-  return {
+  const out: Record<string, unknown> = {
     role,
     name,
     content: contentParts,
   };
+  if (tool_calls?.length) out.tool_calls = tool_calls;
+  return out;
 };
 
 const normalizeToolChoice = (
@@ -337,4 +346,93 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   }
 
   return (await response.json()) as InvokeResult;
+}
+
+/** 流式补全（不支持 json_schema / 强制工具） */
+export async function* invokeLLMStream(
+  params: Omit<
+    InvokeParams,
+    "outputSchema" | "output_schema" | "responseFormat" | "response_format"
+  >
+): AsyncGenerator<string, void, unknown> {
+  assertApiKey();
+  const {
+    messages,
+    tools,
+    toolChoice,
+    tool_choice,
+    max_tokens,
+    maxTokens,
+  } = params;
+  const modelId = ENV.llmModel;
+  const maxOut = max_tokens ?? maxTokens ?? 32768;
+  const payload: Record<string, unknown> = {
+    model: modelId,
+    messages: messages.map(normalizeMessage),
+    stream: true,
+  };
+  if (tools && tools.length > 0) payload.tools = tools;
+  const normalizedToolChoice = normalizeToolChoice(
+    toolChoice || tool_choice,
+    tools
+  );
+  if (normalizedToolChoice) {
+    payload.tool_choice = normalizedToolChoice;
+  }
+  if (modelId.toLowerCase().includes("gemini")) {
+    payload.max_tokens = maxOut;
+    payload.thinking = { budget_tokens: 128 };
+  } else {
+    payload.max_completion_tokens = maxOut;
+  }
+
+  const response = await fetch(resolveApiUrl(), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${ENV.forgeApiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `LLM stream failed: ${response.status} ${response.statusText} – ${errorText}`
+    );
+  }
+
+  const body = response.body;
+  if (!body) throw new Error("LLM stream: empty body");
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n");
+      buffer = parts.pop() ?? "";
+      for (const line of parts) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") return;
+        try {
+          const json = JSON.parse(data) as {
+            choices?: Array<{ delta?: { content?: string } }>;
+          };
+          const chunk = json.choices?.[0]?.delta?.content;
+          if (chunk) yield chunk;
+        } catch {
+          /* skip malformed line */
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }

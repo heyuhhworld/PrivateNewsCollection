@@ -7,6 +7,7 @@ import { eq } from "drizzle-orm";
 import { getDevBypassUser } from "./devAuth";
 import { ENV } from "./env";
 import { invokeLLM } from "./llm";
+import { scheduleArticleEmbedding } from "./articleEmbedding";
 import { sdk } from "./sdk";
 import type { User } from "../../drizzle/schema";
 import {
@@ -345,6 +346,7 @@ export function registerNewsUploadRoutes(app: Express) {
           .where(eq(newsArticles.originalUrl, syntheticUrl))
           .limit(1);
         const finalId = row[0]?.id;
+        if (finalId != null) scheduleArticleEmbedding(finalId);
 
         res.json({
           success: true,

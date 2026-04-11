@@ -93,6 +93,8 @@ export const newsArticles = mysqlTable("news_articles", {
   extractedLinePageMap: json("extractedLinePageMap").$type<number[] | null>(),
   /** 详情页浏览累计，用于列表热度展示 */
   viewCount: int("viewCount").default(0).notNull(),
+  /** 标题+摘要+要点 的 embedding，用于语义检索（JSON 浮点数组） */
+  embedding: json("embedding").$type<number[] | null>(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 
@@ -111,6 +113,16 @@ export const chatMessages = mysqlTable("chat_messages", {
 
 export type ChatMessage = typeof chatMessages.$inferSelect;
 export type InsertChatMessage = typeof chatMessages.$inferInsert;
+
+/** AI 生成的每日简报（晨报） */
+export const aiBriefings = mysqlTable("ai_briefings", {
+  id: int("id").autoincrement().primaryKey(),
+  body: text("body").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type AiBriefing = typeof aiBriefings.$inferSelect;
+export type InsertAiBriefing = typeof aiBriefings.$inferInsert;
 
 // 稽后再看书签表
 // 用户收藏的资讯，支持未登录用户通过 sessionId 识别
@@ -164,3 +176,60 @@ export const crawlLogs = mysqlTable("crawl_logs", {
 
 export type CrawlLog = typeof crawlLogs.$inferSelect;
 export type InsertCrawlLog = typeof crawlLogs.$inferInsert;
+
+// ─── 知识图谱：实体 ──────────────────────────────────────────────────────────
+export const entities = mysqlTable("entities", {
+  id: int("id").autoincrement().primaryKey(),
+  name: varchar("name", { length: 256 }).notNull(),
+  type: mysqlEnum("type", ["fund", "institution", "person", "other"]).notNull(),
+  aliases: json("aliases").$type<string[]>(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+export type Entity = typeof entities.$inferSelect;
+export type InsertEntity = typeof entities.$inferInsert;
+
+// 实体 ↔ 文章关联
+export const entityArticles = mysqlTable("entity_articles", {
+  id: int("id").autoincrement().primaryKey(),
+  entityId: int("entityId").notNull(),
+  articleId: int("articleId").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+export type EntityArticle = typeof entityArticles.$inferSelect;
+
+// 实体关系
+export const entityRelations = mysqlTable("entity_relations", {
+  id: int("id").autoincrement().primaryKey(),
+  sourceEntityId: int("sourceEntityId").notNull(),
+  targetEntityId: int("targetEntityId").notNull(),
+  relationType: varchar("relationType", { length: 64 }).notNull(),
+  articleId: int("articleId").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+export type EntityRelation = typeof entityRelations.$inferSelect;
+export type InsertEntityRelation = typeof entityRelations.$inferInsert;
+
+// ─── 标签修正记录 ────────────────────────────────────────────────────────────
+export const tagCorrections = mysqlTable("tag_corrections", {
+  id: int("id").autoincrement().primaryKey(),
+  articleId: int("articleId").notNull(),
+  userId: int("userId"),
+  fieldName: mysqlEnum("fieldName", ["tags", "strategy", "region"]).notNull(),
+  oldValue: text("oldValue"),
+  newValue: text("newValue"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+export type TagCorrection = typeof tagCorrections.$inferSelect;
+export type InsertTagCorrection = typeof tagCorrections.$inferInsert;
+
+// ─── 简报推送订阅 ────────────────────────────────────────────────────────────
+export const briefingSubscriptions = mysqlTable("briefing_subscriptions", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId"),
+  email: varchar("email", { length: 320 }),
+  webhookUrl: varchar("webhookUrl", { length: 1024 }),
+  isEnabled: boolean("isEnabled").default(true).notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+export type BriefingSubscription = typeof briefingSubscriptions.$inferSelect;
+export type InsertBriefingSubscription = typeof briefingSubscriptions.$inferInsert;

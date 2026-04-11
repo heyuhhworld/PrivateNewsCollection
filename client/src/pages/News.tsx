@@ -29,10 +29,15 @@ import {
   Upload,
   X,
   Flame,
+  Sparkles,
 } from "lucide-react";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
 import { useMemo } from "react";
+import type { inferRouterOutputs } from "@trpc/server";
+import type { AppRouter } from "../../../server/routers";
+
+type NewsListItem = inferRouterOutputs<AppRouter>["news"]["list"]["items"][number];
 
 const STRATEGIES = [
   "私募股权", "风险投资", "房地产", "信贷", "基础设施",
@@ -109,6 +114,13 @@ export default function News() {
   const [showBookmarks, setShowBookmarks] = useState(false);
   /** 与 AI 助手快捷筛选联动：今日 / 本周热度 Top3 */
   const [smartPreset, setSmartPreset] = useState<null | "today" | "weekTop3">(null);
+  /** AI 自然语言解析后的列表覆盖（与常规分页列表二选一展示） */
+  const [smartList, setSmartList] = useState<{
+    items: NewsListItem[];
+    semanticOnly: boolean;
+  } | null>(null);
+  /** 点「AI」但搜索框为空时，在搜索行下方提示（避免 Sonner 飘在右下角像 AI 助手提示） */
+  const [aiSearchHint, setAiSearchHint] = useState<string | null>(null);
   const sessionId = useMemo(() => getSessionId(), []);
   const PAGE_SIZE = 15;
 
@@ -192,7 +204,50 @@ export default function News() {
 
   const { data, isLoading, isError, error, refetch } = trpc.news.list.useQuery(listQueryInput);
 
+  const smartSearchMutation = trpc.news.smartSearch.useMutation({
+    onSuccess: (out) => {
+      const i = out.intent as Record<string, unknown>;
+      if (!out.semanticOnly && i) {
+        if (i.source === "Preqin" || i.source === "Pitchbook" || i.source === "Manual") {
+          setSource(i.source);
+        }
+        if (typeof i.strategy === "string" && i.strategy) setStrategy(i.strategy);
+        if (typeof i.region === "string" && i.region) setRegion(i.region);
+        if (i.recordCategory === "report" || i.recordCategory === "news") {
+          setListCategory(i.recordCategory);
+        }
+      }
+      setSmartList({
+        items: out.items as NewsListItem[],
+        semanticOnly: out.semanticOnly,
+      });
+      setSmartPreset(null);
+      setAiSearchHint(null);
+      toast.success(out.semanticOnly ? "已用语义检索" : "已应用 AI 解析筛选");
+    },
+    onError: (e) => toast.error(e.message),
+  });
+
+  const { data: recData } = trpc.news.recommend.useQuery({ sessionId });
+
+  const handleAiSearch = useCallback(() => {
+    const q = searchInput.trim();
+    if (!q) {
+      setAiSearchHint(
+        "请先在左侧输入框里用一句话描述想找的内容，再点「AI」。示例：最近一周亚太私募股权资讯、只看 Pitchbook 房地产报告"
+      );
+      return;
+    }
+    setAiSearchHint(null);
+    smartSearchMutation.mutate({ query: q });
+  }, [searchInput, smartSearchMutation]);
+
+  const displayItems = smartList?.items ?? data?.items ?? [];
+  const showMainLoading = !smartList && isLoading;
+  const showMainError = !smartList && isError;
+
   const handleSearch = useCallback(() => {
+    setSmartList(null);
     setKeyword(searchInput);
     setPage(1);
   }, [searchInput]);
@@ -210,15 +265,19 @@ export default function News() {
     setSearchInput("");
     setPage(1);
     setSmartPreset(null);
+    setSmartList(null);
+    setAiSearchHint(null);
     setLocation("/news");
   }, [setLocation]);
 
   const switchListCategory = useCallback((cat: "report" | "news") => {
     setListCategory(cat);
     setPage(1);
+    setSmartList(null);
   }, []);
 
-  const hasFilters = source || strategy || region || keyword || dateRange || smartPreset;
+  const hasFilters =
+    source || strategy || region || keyword || dateRange || smartPreset || smartList;
   const totalPages = data ? Math.ceil(data.total / PAGE_SIZE) : 0;
 
   // Bookmarks
@@ -282,11 +341,13 @@ export default function News() {
                 }`}>{bookmarksData.length}</span>
               )}
             </button>
-            {data && (
+            {(data || smartList) && (
               <span className="text-sm text-gray-400">
-                {smartPreset === "weekTop3"
-                  ? `近 7 日热度 · 展示前 3 条（候选共 ${data.total} 条）`
-                  : `共 ${data.total} 条`}
+                {smartList
+                  ? `AI 结果 · ${smartList.items.length} 条${smartList.semanticOnly ? "（语义）" : ""}`
+                  : smartPreset === "weekTop3"
+                    ? `近 7 日热度 · 展示前 3 条（候选共 ${data?.total ?? 0} 条）`
+                    : `共 ${data?.total ?? 0} 条`}
               </span>
             )}
           </div>
@@ -310,31 +371,53 @@ export default function News() {
             筛选：
           </div>
 
-          {/* Search */}
-          <div className="flex items-center gap-1.5 flex-1 min-w-[200px] max-w-xs">
-            <div className="relative flex-1">
-              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
-              <Input
-                placeholder="搜索标题或摘要..."
-                value={searchInput}
-                onChange={(e) => setSearchInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-                className="pl-8 h-8 text-sm border-gray-200"
-              />
+          {/* Search：与右侧「AI 资讯助手」无关；AI 按钮只解析本行输入并刷新下方列表 */}
+          <div className="flex flex-col gap-1 flex-1 min-w-[200px] max-w-lg">
+            <div className="flex items-center gap-1.5">
+              <div className="relative flex-1 min-w-0">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
+                <Input
+                  placeholder="关键词搜索；或输入一句话后点「AI」智能筛选/语义检索"
+                  value={searchInput}
+                  onChange={(e) => {
+                    setSearchInput(e.target.value);
+                    setAiSearchHint(null);
+                  }}
+                  onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                  className="pl-8 h-8 text-sm border-gray-200"
+                />
+              </div>
+              <Button
+                size="sm"
+                onClick={handleSearch}
+                className="h-8 px-3 bg-[#1677ff] hover:bg-[#0958d9] text-white text-xs shrink-0"
+              >
+                搜索
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void handleAiSearch()}
+                disabled={smartSearchMutation.isPending}
+                className="h-8 px-2 gap-1 text-xs shrink-0"
+                title="根据本框文字解析筛选条件，或做语义检索（仅影响当前资讯列表）"
+              >
+                <Sparkles className="h-3.5 w-3.5 text-violet-600" />
+                AI
+              </Button>
             </div>
-            <Button
-              size="sm"
-              onClick={handleSearch}
-              className="h-8 px-3 bg-[#1677ff] hover:bg-[#0958d9] text-white text-xs"
-            >
-              搜索
-            </Button>
+            {aiSearchHint && (
+              <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5 leading-relaxed">
+                {aiSearchHint}
+              </p>
+            )}
           </div>
 
           {/* Source Filter */}
           <Select
             value={source || "all"}
             onValueChange={(v) => {
+              setSmartList(null);
               setSource(v === "all" ? "" : (v as "Preqin" | "Pitchbook" | "Manual"));
               setPage(1);
             }}
@@ -354,6 +437,7 @@ export default function News() {
           <Select
             value={strategy || "all"}
             onValueChange={(v) => {
+              setSmartList(null);
               setStrategy(v === "all" ? "" : v);
               setPage(1);
             }}
@@ -373,6 +457,7 @@ export default function News() {
           <Select
             value={region || "all"}
             onValueChange={(v) => {
+              setSmartList(null);
               setRegion(v === "all" ? "" : v);
               setPage(1);
             }}
@@ -392,6 +477,7 @@ export default function News() {
           <Select
             value={dateRange || "all"}
             onValueChange={(v) => {
+              setSmartList(null);
               setDateRange(v === "all" ? "" : v);
               setPage(1);
             }}
@@ -450,6 +536,15 @@ export default function News() {
             {keyword && (
               <Badge variant="secondary" className="text-xs gap-1 cursor-pointer" onClick={handleClearKeyword}>
                 关键词: {keyword} <X className="h-2.5 w-2.5" />
+              </Badge>
+            )}
+            {smartList && (
+              <Badge
+                variant="secondary"
+                className="text-xs gap-1 cursor-pointer bg-violet-50 text-violet-800 border-violet-200"
+                onClick={() => setSmartList(null)}
+              >
+                AI 结果 · 点击恢复标准列表 <X className="h-2.5 w-2.5" />
               </Badge>
             )}
           </div>
@@ -520,7 +615,27 @@ export default function News() {
 
         {/* News List */}
         {!showBookmarks && (<div className="flex-1 overflow-y-auto">
-          {isLoading ? (
+          {recData && recData.items.length > 0 && !smartList && (
+            <div className="px-4 pt-3 pb-1 border-b border-gray-100 bg-gradient-to-r from-violet-50/50 to-transparent">
+              <p className="text-xs font-medium text-violet-800 mb-2 flex items-center gap-1">
+                <Sparkles className="h-3.5 w-3.5" />
+                {recData.mode === "personalized" ? "为你推荐" : "热门阅读"}
+              </p>
+              <div className="flex gap-2 overflow-x-auto pb-2">
+                {recData.items.map((a) => (
+                  <button
+                    key={a.id}
+                    type="button"
+                    onClick={() => setLocation(`/news/${a.id}`)}
+                    className="shrink-0 max-w-[220px] text-left text-xs px-3 py-2 rounded-lg bg-white border border-violet-100 hover:border-violet-300 hover:shadow-sm transition-all line-clamp-2"
+                  >
+                    {a.title}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {showMainLoading ? (
             <div className="p-6 space-y-3">
               {Array.from({ length: 8 }).map((_, i) => (
                 <div key={i} className="bg-white rounded-lg p-4 border border-gray-100">
@@ -530,7 +645,7 @@ export default function News() {
                 </div>
               ))}
             </div>
-          ) : isError ? (
+          ) : showMainError ? (
             <div className="flex flex-col items-center justify-center min-h-64 px-6 py-12 text-center">
               <Newspaper className="h-12 w-12 mb-3 text-red-200" />
               <p className="text-sm font-medium text-red-700">列表加载失败</p>
@@ -552,7 +667,7 @@ export default function News() {
                 重试
               </Button>
             </div>
-          ) : data?.items.length === 0 ? (
+          ) : displayItems.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-64 text-gray-400 px-6 text-center">
               <Newspaper className="h-12 w-12 mb-3 opacity-30" />
               <p className="text-sm">暂无符合条件的资讯条目</p>
@@ -564,7 +679,7 @@ export default function News() {
             </div>
           ) : (
             <div className="p-4 space-y-2">
-              {data?.items.map((article) => (
+              {displayItems.map((article) => (
                 <div
                   key={article.id}
                   onClick={() => setLocation(`/news/${article.id}`)}
@@ -641,7 +756,7 @@ export default function News() {
           )}
 
           {/* Pagination */}
-          {smartPreset !== "weekTop3" && totalPages > 1 && (
+          {smartPreset !== "weekTop3" && !smartList && totalPages > 1 && (
             <div className="flex items-center justify-center gap-3 py-4 border-t border-gray-100 bg-white">
               <Button
                 variant="outline"

@@ -33,5 +33,20 @@ export const ENV = {
     process.env.LLM_MODEL?.trim() ||
     process.env.OPENAI_MODEL?.trim() ||
     "gpt-5.4",
+  /** OpenAI 兼容 /v1/embeddings；默认 text-embedding-3-small */
+  embeddingModel:
+    process.env.EMBEDDING_MODEL?.trim() || "text-embedding-3-small",
+  /** 完整 Embeddings URL；未设则用 embeddingOpenAiBaseUrl 或 forgeApiUrl 拼 /v1/embeddings */
+  embeddingApiUrl: process.env.EMBEDDING_API_URL?.trim() || "",
+  /** 仅基址，拼 /v1/embeddings；可与 chat 的 forgeApiUrl 不同（网关无 embeddings 时用） */
+  embeddingOpenAiBaseUrl: process.env.EMBEDDING_OPENAI_BASE_URL?.trim() || "",
+  /** Cron 表达式：定时生成并推送简报；默认工作日早 8:30 */
+  briefingCron: process.env.BRIEFING_CRON?.trim() || "30 8 * * 1-5",
+  /** SMTP 邮件 */
+  smtpHost: process.env.SMTP_HOST?.trim() || "",
+  smtpPort: parseInt(process.env.SMTP_PORT?.trim() || "465", 10),
+  smtpUser: process.env.SMTP_USER?.trim() || "",
+  smtpPass: process.env.SMTP_PASS?.trim() || "",
+  smtpFrom: process.env.SMTP_FROM?.trim() || process.env.SMTP_USER?.trim() || "",
   devAuthBypass,
 };

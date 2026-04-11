@@ -1,79 +1,220 @@
 import { z } from "zod";
 import { publicProcedure, router } from "../_core/trpc";
-import { getChatHistory, saveChatMessage, getNewsArticleById } from "../db";
+import {
+  getChatHistory,
+  saveChatMessage,
+  getNewsArticleById,
+} from "../db";
 import { invokeLLM } from "../_core/llm";
-import { getNewsArticles } from "../db";
+import type { Message, Tool, ToolCall } from "../_core/llm";
+import { semanticSearchArticles } from "../_core/semanticSearch";
+import {
+  appendCitedArticleLinks,
+  buildArticleRefMap,
+  buildNewsContextBlock,
+  collectCitationsFromAnswer,
+  GLOBAL_CHAT_SYSTEM_RULES,
+  resolveRelevantArticlesForChat,
+} from "../_core/chatShared";
+import type { NewsArticle } from "../../drizzle/schema";
 
-// ─── Helper: search relevant articles ─────────────────────────────────────
+const CHAT_AGENT_TOOLS: Tool[] = [
+  {
+    type: "function",
+    function: {
+      name: "search_articles",
+      description:
+        "在资讯库中语义检索相关文章。可对用户问题换说法多次检索。结果会分配 [文章N] 编号。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "检索查询（中文或英文）" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_article_detail",
+      description:
+        "按文章 ID 获取较长正文片段（优先抽取文本）。仅在需要细节时调用。",
+      parameters: {
+        type: "object",
+        properties: { articleId: { type: "integer" } },
+        required: ["articleId"],
+      },
+    },
+  },
+];
 
-/**
- * Retrieve articles from DB that are relevant to the user's question.
- * We fetch recent articles and let the LLM pick the most relevant ones.
- * Returns up to 8 articles with their IDs and URLs for citation.
- */
-async function getRelevantArticles(question: string) {
-  try {
-    const { items } = await getNewsArticles({ pageSize: 30 });
-    if (items.length === 0) return [];
-
-    // Simple keyword-based pre-filter to reduce LLM context size
-    const q = question.toLowerCase();
-    const keywords = q.split(/\s+/).filter((w) => w.length > 1);
-
-    const scored = items.map((article) => {
-      const text = [
-        article.title,
-        article.summary ?? "",
-        article.content ?? "",
-        article.strategy ?? "",
-        article.region ?? "",
-        (article.tags as string[] | null ?? []).join(" "),
-      ]
-        .join(" ")
-        .toLowerCase();
-
-      let score = 0;
-      for (const kw of keywords) {
-        if (text.includes(kw)) score++;
-      }
-      return { article, score };
-    });
-
-    // Return top 8 by relevance score (fall back to most recent if all score 0)
-    const sorted = scored.sort((a, b) => b.score - a.score);
-    return sorted.slice(0, 8).map((s) => s.article);
-  } catch {
-    return [];
+function textFromAssistantContent(raw: unknown): string {
+  if (typeof raw === "string") return raw;
+  if (Array.isArray(raw)) {
+    return raw
+      .filter(
+        (c): c is { type?: string; text?: string } =>
+          typeof c === "object" && c != null && "type" in c
+      )
+      .filter((c) => c.type === "text")
+      .map((c) => c.text ?? "")
+      .join("");
   }
+  return "";
+}
+
+function formatRefTable(refOrder: { id: number; title: string }[]): string {
+  if (refOrder.length === 0) return "（暂无）";
+  return refOrder
+    .map((r, i) => `[文章${i + 1}] id=${r.id} | ${r.title}`)
+    .join("\n");
+}
+
+async function runAgentTool(
+  tc: ToolCall,
+  refOrder: { id: number; title: string }[]
+): Promise<string> {
+  const name = tc.function.name;
+  let args: Record<string, unknown> = {};
+  try {
+    args = JSON.parse(tc.function.arguments || "{}");
+  } catch {
+    return JSON.stringify({ error: "参数 JSON 无效" });
+  }
+  if (name === "search_articles") {
+    const q = String(args.query ?? "").trim();
+    if (!q) return JSON.stringify({ error: "query 为空" });
+    const arts = await semanticSearchArticles(q, {
+      limit: 8,
+      fallbackKeyword: true,
+    });
+    const prevLen = refOrder.length;
+    for (const a of arts) {
+      if (!refOrder.some((x) => x.id === a.id)) {
+        refOrder.push({ id: a.id, title: a.title });
+      }
+    }
+    return JSON.stringify({
+      addedCount: refOrder.length - prevLen,
+      totalRefs: refOrder.length,
+      refTable: formatRefTable(refOrder),
+      previews: arts.map((a) => ({
+        id: a.id,
+        title: a.title,
+        summary: (a.summary ?? "").slice(0, 400),
+        source: a.source,
+      })),
+    });
+  }
+  if (name === "get_article_detail") {
+    const id = Math.floor(Number(args.articleId));
+    if (!Number.isFinite(id)) return JSON.stringify({ error: "articleId 无效" });
+    const doc = await getNewsArticleById(id);
+    if (!doc || doc.isHidden) return JSON.stringify({ error: "未找到文章" });
+    const body = (doc.extractedText ?? doc.content ?? doc.summary ?? "").slice(
+      0,
+      15_000
+    );
+    return JSON.stringify({
+      id: doc.id,
+      title: doc.title,
+      source: doc.source,
+      body,
+    });
+  }
+  return JSON.stringify({ error: "未知工具" });
+}
+
+async function runGlobalAgentChat(
+  message: string,
+  historyMessages: { role: "user" | "assistant"; content: string }[],
+  seedArticles: NewsArticle[]
+): Promise<{ content: string; refOrder: { id: number; title: string }[] }> {
+  const refOrder: { id: number; title: string }[] = [];
+  for (const a of seedArticles) {
+    if (!refOrder.some((x) => x.id === a.id)) {
+      refOrder.push({ id: a.id, title: a.title });
+    }
+  }
+  const initialCtx = buildNewsContextBlock(seedArticles);
+  const systemText = `${GLOBAL_CHAT_SYSTEM_RULES}
+
+【初步语义检索结果】（务必优先使用；不足时再调用工具）
+${initialCtx || "（无）"}
+
+【当前引用表】引用资讯时请使用 [文章N]，N 与下表一致：
+${formatRefTable(refOrder)}
+
+可用工具：
+- search_articles：补充检索，新文章会追加到引用表并更新编号；
+- get_article_detail：按 id 拉取长正文。`;
+
+  const messages: Message[] = [
+    { role: "system", content: systemText },
+    ...historyMessages.map((m) => ({ role: m.role, content: m.content })),
+    { role: "user", content: message },
+  ];
+
+  let assistantContent = "抱歉，我暂时无法回答这个问题。";
+
+  for (let step = 0; step < 8; step += 1) {
+    const response = await invokeLLM({
+      messages,
+      tools: CHAT_AGENT_TOOLS,
+      tool_choice: "auto",
+    } as any);
+    const choice = response.choices?.[0]?.message;
+    if (!choice) break;
+
+    const toolCalls = choice.tool_calls;
+    if (toolCalls && toolCalls.length > 0) {
+      const contentStr = textFromAssistantContent(choice.content);
+      messages.push({
+        role: "assistant",
+        content: contentStr || null,
+        tool_calls: toolCalls,
+      } as Message);
+      for (const tc of toolCalls) {
+        const out = await runAgentTool(tc, refOrder);
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: out,
+        } as Message);
+      }
+      continue;
+    }
+
+    assistantContent = textFromAssistantContent(choice.content) || assistantContent;
+    break;
+  }
+
+  return { content: assistantContent, refOrder };
 }
 
 // ─── Router ────────────────────────────────────────────────────────────────
 
 export const chatRouter = router({
-  // 获取对话历史
   history: publicProcedure
     .input(z.object({ sessionId: z.string() }))
     .query(async ({ input }) => {
       return getChatHistory(input.sessionId);
     }),
 
-  // 发送消息并获取 AI 回复（含资讯引用链接）
   send: publicProcedure
     .input(
-        z.object({
+      z.object({
         sessionId: z.string(),
         message: z.string().min(1).max(2000),
         userId: z.number().optional(),
-        /** 指定资讯详情页当前文档时，优先基于该条（含上传文件全文）回答 */
         articleId: z.number().int().optional(),
-        // Frontend base URL so we can build internal article links
         origin: z.string().optional(),
       })
     )
     .mutation(async ({ input }) => {
       const { sessionId, message, userId, origin, articleId } = input;
 
-      // 保存用户消息
       await saveChatMessage({
         sessionId,
         userId: userId ?? null,
@@ -104,32 +245,12 @@ ${raw || "（无文本）"}
         }
       }
 
-      // 获取相关资讯作为上下文（全局问答也严格仅基于入库资讯）
       const relevantArticles = articleId
         ? []
-        : await getRelevantArticles(message);
+        : await resolveRelevantArticlesForChat(message);
 
-      // Build context with article IDs for citation
-      const newsContext = relevantArticles
-        .map(
-          (n, i) =>
-            `[文章${i + 1}] ID:${n.id} | 来源:${n.source} | 标题:${n.title}\n` +
-            `摘要: ${n.summary ?? ""}\n` +
-            `详细内容: ${(n.content ?? "").slice(0, 500)}\n` +
-            `策略: ${n.strategy ?? "—"} | 地区: ${n.region ?? "—"} | 发布: ${n.publishedAt.toISOString().slice(0, 10)}`
-        )
-        .join("\n\n---\n\n");
+      let articleRefMap = buildArticleRefMap(relevantArticles);
 
-      // Build article reference map for appending links
-      const articleRefMap = relevantArticles.reduce(
-        (acc, n, i) => {
-          acc[`文章${i + 1}`] = { id: n.id, title: n.title };
-          return acc;
-        },
-        {} as Record<string, { id: number; title: string }>
-      );
-
-      // 获取历史对话
       const history = await getChatHistory(sessionId);
       const historyMessages = history.slice(-10).map((m) => ({
         role: m.role as "user" | "assistant",
@@ -240,68 +361,27 @@ ${numbered || "（无可用文本）"}
         if (relevantArticles.length === 0) {
           assistantContent = "资讯库未提供与该问题直接相关的信息。";
         } else {
-        // 调用 LLM（全局资讯模式）
-        const response = await invokeLLM({
-        messages: [
-          {
-            role: "system",
-            content: `你是 IPMS 投资项目管理系统的智能资讯助手。你必须且只能基于提供的「相关资讯数据」回答，严禁使用外部知识、常识补充、猜测或发散推断。
-
-回答规则（必须严格遵守）：
-1) 仅使用给定资讯中的事实；若证据不足，明确回答“资讯库未提供相关信息”；
-2) 不得编造时间、数字、机构观点或结论；
-3) 输出中文，简洁、可执行；
-4) 仅在有明确依据时引用 [文章N]，不要滥引；
-5) 若用户问题范围过大，先给基于已知资讯的结论，再指出信息缺口。
-
-${focusedDocBlock ? `用户正在阅读某篇资讯/上传文件。你必须严格遵循：
-1) 默认仅基于下方「当前聚焦文档」回答；
-2) 若问题在文档中找不到依据，明确回复“当前文档未提供该信息”；
-3) 禁止使用通用常识、外部知识补充事实；
-4) 回答开头用一句话说明“以下基于当前文档内容回答”。\n\n${focusedDocBlock}\n` : ""}
-
-相关资讯数据（供参考）：
-${newsContext || "（暂无相关资讯）"}`,
-          },
-          ...historyMessages,
-          { role: "user", content: message },
-        ],
-      });
-
-        const rawContent = response.choices?.[0]?.message?.content;
-        assistantContent =
-          typeof rawContent === "string"
-            ? rawContent
-            : "抱歉，我暂时无法回答这个问题。";
+          const agentOut = await runGlobalAgentChat(
+            message,
+            historyMessages,
+            relevantArticles
+          );
+          assistantContent = agentOut.content;
+          articleRefMap = agentOut.refOrder.reduce(
+            (acc, r, i) => {
+              acc[`文章${i + 1}`] = { id: r.id, title: r.title };
+              return acc;
+            },
+            {} as Record<string, { id: number; title: string }>
+          );
         }
 
-      // ── Append cited article links ──────────────────────────────────────
-      // Find which [文章N] references appear in the answer（含可选空格 [文章 1]）
-      const citedRefs = new Set<string>();
-      for (const ref of Object.keys(articleRefMap)) {
-        const n = ref.replace(/^文章/, "");
-        const patterns = [`[${ref}]`, `[文章 ${n}]`, `[文章${n}]`];
-        if (patterns.some((p) => assistantContent.includes(p))) {
-          citedRefs.add(ref);
-        }
-      }
-
-        if (citedRefs.size > 0) {
-          const baseUrl = origin ?? "";
-          const linkLines = Array.from(citedRefs)
-            .sort((a, b) => {
-              const na = parseInt(a.replace(/\D/g, ""), 10) || 0;
-              const nb = parseInt(b.replace(/\D/g, ""), 10) || 0;
-              return na - nb;
-            })
-            .map((ref) => {
-              const { id, title } = articleRefMap[ref];
-              const url = `${baseUrl}/news/${id}`;
-              return `- [${title}](${url})`;
-            });
-
-          assistantContent +=
-            "\n\n---\n**相关资讯链接：**\n" + linkLines.join("\n");
+        if (!articleId && relevantArticles.length > 0) {
+          assistantContent = appendCitedArticleLinks(
+            assistantContent,
+            articleRefMap,
+            origin
+          );
         }
       }
 
@@ -309,7 +389,6 @@ ${newsContext || "（暂无相关资讯）"}`,
         assistantContent = `以下基于当前文档内容回答。\n\n${assistantContent}`;
       }
 
-      // 保存 AI 回复
       await saveChatMessage({
         sessionId,
         userId: userId ?? null,
@@ -317,35 +396,11 @@ ${newsContext || "（暂无相关资讯）"}`,
         content: assistantContent,
       });
 
-      const citationList: { refKey: string; articleId: number; title: string }[] = [];
-      if (!articleId && relevantArticles.length > 0) {
-        const cited = new Set<string>();
-        for (const ref of Object.keys(articleRefMap)) {
-          const n = ref.replace(/^文章/, "");
-          const patterns = [`[${ref}]`, `[文章 ${n}]`, `[文章${n}]`];
-          if (patterns.some((p) => assistantContent.includes(p))) {
-            cited.add(ref);
-          }
-        }
-        for (const ref of Array.from(cited).sort((a, b) => {
-          const na = parseInt(a.replace(/\D/g, ""), 10) || 0;
-          const nb = parseInt(b.replace(/\D/g, ""), 10) || 0;
-          return na - nb;
-        })) {
-          const meta = articleRefMap[ref];
-          if (meta) {
-            citationList.push({
-              refKey: ref,
-              articleId: meta.id,
-              title: meta.title,
-            });
-          }
-        }
-      }
+      const citationList = collectCitationsFromAnswer(assistantContent, articleRefMap);
 
       return {
         content: assistantContent,
-        citations: citationList,
+        citations: !articleId ? citationList : [],
         references: references ?? [],
       };
     }),

@@ -146,6 +146,7 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
   /** 避免在会话中途被 history 查询刷新覆盖本地消息 */
   const lastHistorySyncSession = useRef<string | null>(null);
 
+  const utils = trpc.useUtils();
   const sendMutation = trpc.chat.send.useMutation();
   const importByUrlMutation = trpc.news.importByUrl.useMutation();
 
@@ -376,28 +377,137 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
     setInput("");
     setIsLoading(true);
 
+    let streamAssistantId: string | null = null;
+
     try {
-      const result = await sendMutation.mutateAsync({
-        sessionId,
-        message: content,
-        articleId,
-        origin: window.location.origin,
+      if (articleId != null) {
+        const result = await sendMutation.mutateAsync({
+          sessionId,
+          message: content,
+          articleId,
+          origin: window.location.origin,
+        });
+        const assistantMsg: Message = {
+          role: "assistant",
+          content: result.content,
+          id: nanoid(),
+          references: result.references,
+          citations: result.citations,
+        };
+        setMessages((prev) => [...prev, assistantMsg]);
+        return;
+      }
+
+      const sid = nanoid();
+      streamAssistantId = sid;
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "", id: sid },
+      ]);
+
+      const res = await fetch("/api/chat/stream", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          sessionId,
+          message: content,
+          origin: window.location.origin,
+        }),
       });
-      const assistantMsg: Message = {
-        role: "assistant",
-        content: result.content,
-        id: nanoid(),
-        references: result.references,
-        citations: result.citations,
+
+      if (!res.ok || !res.body) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(errText || `HTTP ${res.status}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let carry = "";
+      let full = "";
+
+      const applyChunk = (text: string) => {
+        full += text;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === streamAssistantId ? { ...m, content: full } : m
+          )
+        );
       };
-      setMessages((prev) => [...prev, assistantMsg]);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        carry += decoder.decode(value, { stream: true });
+        const parts = carry.split("\n\n");
+        carry = parts.pop() ?? "";
+        for (const block of parts) {
+          const line = block.trim();
+          if (!line.startsWith("data:")) continue;
+          const raw = line.slice(5).trim();
+          try {
+            const ev = JSON.parse(raw) as {
+              type?: string;
+              text?: string;
+              content?: string;
+              citations?: CitationItem[];
+              message?: string;
+            };
+            if (ev.type === "chunk" && ev.text) applyChunk(ev.text);
+            if (ev.type === "done") {
+              const finalText = ev.content ?? full;
+              full = finalText;
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === streamAssistantId
+                    ? {
+                        ...m,
+                        content: finalText,
+                        citations: ev.citations,
+                      }
+                    : m
+                )
+              );
+            }
+            if (ev.type === "error") {
+              throw new Error(ev.message ?? "流式输出失败");
+            }
+          } catch (e) {
+            if (e instanceof SyntaxError) continue;
+            throw e;
+          }
+        }
+      }
+
+      if (!full.trim()) {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === streamAssistantId
+              ? { ...m, content: "未收到模型回复，请重试。" }
+              : m
+          )
+        );
+      }
+
+      await utils.chat.history.invalidate({ sessionId }).catch(() => {});
     } catch (err) {
       const errorMsg: Message = {
         role: "assistant",
         content: "抱歉，请求失败，请稍后重试。",
         id: nanoid(),
       };
-      setMessages((prev) => [...prev, errorMsg]);
+      setMessages((prev) => {
+        const withoutEmpty = prev.filter(
+          (m) =>
+            !(
+              streamAssistantId &&
+              m.id === streamAssistantId &&
+              m.role === "assistant" &&
+              m.content.trim() === ""
+            )
+        );
+        return [...withoutEmpty, errorMsg];
+      });
     } finally {
       setIsLoading(false);
       textareaRef.current?.focus();

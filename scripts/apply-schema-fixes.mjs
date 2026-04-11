@@ -105,6 +105,26 @@ async function main() {
         console.log("news_articles.viewCount 已存在");
       }
 
+      if (!(await columnExists(conn, "news_articles", "embedding"))) {
+        await conn.query(
+          "ALTER TABLE `news_articles` ADD COLUMN `embedding` JSON NULL AFTER `viewCount`"
+        );
+        console.log("已添加 news_articles.embedding");
+      } else {
+        console.log("news_articles.embedding 已存在");
+      }
+      if (!(await tableExists(conn, "ai_briefings"))) {
+        await conn.query(`CREATE TABLE \`ai_briefings\` (
+  \`id\` int AUTO_INCREMENT NOT NULL,
+  \`body\` text NOT NULL,
+  \`createdAt\` timestamp NOT NULL DEFAULT (now()),
+  CONSTRAINT \`ai_briefings_id\` PRIMARY KEY(\`id\`)
+)`);
+        console.log("已创建 ai_briefings");
+      } else {
+        console.log("ai_briefings 表已存在");
+      }
+
       const extractedType = await getColumnDataType(
         conn,
         "news_articles",
@@ -133,6 +153,66 @@ async function main() {
       }
     } else {
       console.log("跳过 users：表不存在");
+    }
+
+    // ── Phase 4 tables ──────────────────────────────────────────────────
+    const phase4Tables = [
+      { name: "entities", sql: `CREATE TABLE IF NOT EXISTS \`entities\` (
+  \`id\` int AUTO_INCREMENT NOT NULL,
+  \`name\` varchar(256) NOT NULL,
+  \`type\` enum('fund','institution','person','other') NOT NULL,
+  \`aliases\` JSON NULL,
+  \`createdAt\` timestamp NOT NULL DEFAULT (now()),
+  CONSTRAINT \`entities_id\` PRIMARY KEY(\`id\`)
+)` },
+      { name: "entity_articles", sql: `CREATE TABLE IF NOT EXISTS \`entity_articles\` (
+  \`id\` int AUTO_INCREMENT NOT NULL,
+  \`entityId\` int NOT NULL,
+  \`articleId\` int NOT NULL,
+  \`createdAt\` timestamp NOT NULL DEFAULT (now()),
+  CONSTRAINT \`entity_articles_id\` PRIMARY KEY(\`id\`),
+  INDEX \`idx_ea_entity\` (\`entityId\`),
+  INDEX \`idx_ea_article\` (\`articleId\`)
+)` },
+      { name: "entity_relations", sql: `CREATE TABLE IF NOT EXISTS \`entity_relations\` (
+  \`id\` int AUTO_INCREMENT NOT NULL,
+  \`sourceEntityId\` int NOT NULL,
+  \`targetEntityId\` int NOT NULL,
+  \`relationType\` varchar(64) NOT NULL,
+  \`articleId\` int NOT NULL,
+  \`createdAt\` timestamp NOT NULL DEFAULT (now()),
+  CONSTRAINT \`entity_relations_id\` PRIMARY KEY(\`id\`),
+  INDEX \`idx_er_source\` (\`sourceEntityId\`),
+  INDEX \`idx_er_target\` (\`targetEntityId\`)
+)` },
+      { name: "tag_corrections", sql: `CREATE TABLE IF NOT EXISTS \`tag_corrections\` (
+  \`id\` int AUTO_INCREMENT NOT NULL,
+  \`articleId\` int NOT NULL,
+  \`userId\` int NULL,
+  \`fieldName\` enum('tags','strategy','region') NOT NULL,
+  \`oldValue\` text NULL,
+  \`newValue\` text NULL,
+  \`createdAt\` timestamp NOT NULL DEFAULT (now()),
+  CONSTRAINT \`tag_corrections_id\` PRIMARY KEY(\`id\`),
+  INDEX \`idx_tc_article\` (\`articleId\`)
+)` },
+      { name: "briefing_subscriptions", sql: `CREATE TABLE IF NOT EXISTS \`briefing_subscriptions\` (
+  \`id\` int AUTO_INCREMENT NOT NULL,
+  \`userId\` int NULL,
+  \`email\` varchar(320) NULL,
+  \`webhookUrl\` varchar(1024) NULL,
+  \`isEnabled\` boolean NOT NULL DEFAULT true,
+  \`createdAt\` timestamp NOT NULL DEFAULT (now()),
+  CONSTRAINT \`briefing_subscriptions_id\` PRIMARY KEY(\`id\`)
+)` },
+    ];
+    for (const t of phase4Tables) {
+      if (!(await tableExists(conn, t.name))) {
+        await conn.query(t.sql);
+        console.log(`已创建 ${t.name}`);
+      } else {
+        console.log(`${t.name} 表已存在`);
+      }
     }
 
     console.log("\nschema 检查完成。请重启 pnpm dev 后重试。");

@@ -1325,6 +1325,22 @@ export default function SystemManagement() {
                             {row.recordCategory === "report" ? "报告" : "资讯"}
                           </span>
                           <span>{row.source}</span>
+                          {row.source === "Manual" && (
+                            <span className="text-gray-600">
+                              上传人{" "}
+                              {row.uploaderName?.trim() ||
+                                row.uploaderEmail?.trim() ||
+                                (row.uploaderUserId != null
+                                  ? `用户#${row.uploaderUserId}`
+                                  : "—")}
+                            </span>
+                          )}
+                          <span>
+                            入库{" "}
+                            {format(new Date(row.createdAt), "yyyy-MM-dd HH:mm", {
+                              locale: zhCN,
+                            })}
+                          </span>
                           <span>
                             {row.isHidden ? (
                               <span className="text-amber-600 inline-flex items-center gap-0.5">
