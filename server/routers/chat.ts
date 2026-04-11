@@ -4,6 +4,8 @@ import {
   getChatHistory,
   saveChatMessage,
   getNewsArticleById,
+  getUserReadingProfile,
+  insertReadingEvent,
 } from "../db";
 import { invokeLLM } from "../_core/llm";
 import type { Message, Tool, ToolCall } from "../_core/llm";
@@ -126,10 +128,20 @@ async function runAgentTool(
   return JSON.stringify({ error: "未知工具" });
 }
 
+async function buildReadingHintText(userId?: number | null): Promise<string> {
+  if (!userId) return "";
+  const p = await getUserReadingProfile(userId);
+  const j = p?.summaryJson as { summaryText?: string } | undefined;
+  const t = j?.summaryText?.trim();
+  if (!t) return "";
+  return `\n【用户阅读习惯摘要】（仅调整表达侧重，事实须来自检索与引用内容）\n${t}`;
+}
+
 async function runGlobalAgentChat(
   message: string,
   historyMessages: { role: "user" | "assistant"; content: string }[],
-  seedArticles: NewsArticle[]
+  seedArticles: NewsArticle[],
+  readingHint = ""
 ): Promise<{ content: string; refOrder: { id: number; title: string }[] }> {
   const refOrder: { id: number; title: string }[] = [];
   for (const a of seedArticles) {
@@ -138,7 +150,7 @@ async function runGlobalAgentChat(
     }
   }
   const initialCtx = buildNewsContextBlock(seedArticles);
-  const systemText = `${GLOBAL_CHAT_SYSTEM_RULES}
+  const systemText = `${GLOBAL_CHAT_SYSTEM_RULES}${readingHint}
 
 【初步语义检索结果】（务必优先使用；不足时再调用工具）
 ${initialCtx || "（无）"}
@@ -215,6 +227,17 @@ export const chatRouter = router({
     .mutation(async ({ input }) => {
       const { sessionId, message, userId, origin, articleId } = input;
 
+      if (userId) {
+        await insertReadingEvent({
+          userId,
+          sessionId,
+          articleId: articleId ?? null,
+          recordCategory: null,
+          eventType: "chat_ask",
+          payload: { len: message.length },
+        });
+      }
+
       await saveChatMessage({
         sessionId,
         userId: userId ?? null,
@@ -286,11 +309,12 @@ ${raw || "（无文本）"}
           })
           .join("\n");
 
+        const readingHint = await buildReadingHintText(userId ?? null);
         const focusedResp = await invokeLLM({
           messages: [
             {
               role: "system",
-              content: `你是严谨的文档问答助手。必须仅根据给定文档文本回答，不得使用外部知识。若文档无依据，明确回答“当前文档未提供该信息”。`,
+              content: `你是严谨的文档问答助手。必须仅根据给定文档文本回答，不得使用外部知识。若文档无依据，明确回答“当前文档未提供该信息”。${readingHint}`,
             },
             {
               role: "user",
@@ -361,10 +385,12 @@ ${numbered || "（无可用文本）"}
         if (relevantArticles.length === 0) {
           assistantContent = "资讯库未提供与该问题直接相关的信息。";
         } else {
+          const readingHint = await buildReadingHintText(userId ?? null);
           const agentOut = await runGlobalAgentChat(
             message,
             historyMessages,
-            relevantArticles
+            relevantArticles,
+            readingHint
           );
           assistantContent = agentOut.content;
           articleRefMap = agentOut.refOrder.reduce(

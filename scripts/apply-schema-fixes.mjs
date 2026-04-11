@@ -215,6 +215,15 @@ async function main() {
       }
     }
 
+    if (!(await tableExists(conn, "article_pdf_highlights"))) {
+      const p14 = path.join(root, "drizzle/0014_reading_interaction.sql");
+      const sql14 = readFileSync(p14, "utf8").trim();
+      await conn.query(sql14);
+      console.log("已执行 0014：reading interaction 表");
+    } else {
+      console.log("article_pdf_highlights 等 reading 表已存在");
+    }
+
     console.log("\nschema 检查完成。请重启 pnpm dev 后重试。");
   } finally {
     await conn.end();

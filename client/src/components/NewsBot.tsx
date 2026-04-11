@@ -147,6 +147,11 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
   const lastHistorySyncSession = useRef<string | null>(null);
 
   const utils = trpc.useUtils();
+  const { data: me } = trpc.auth.me.useQuery();
+  const { data: profileSnippet } = trpc.reading.profileSnippet.useQuery(undefined, {
+    enabled: articleId == null && !!me?.id,
+    staleTime: 120_000,
+  });
   const sendMutation = trpc.chat.send.useMutation();
   const importByUrlMutation = trpc.news.importByUrl.useMutation();
 
@@ -385,6 +390,7 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
           sessionId,
           message: content,
           articleId,
+          userId: me?.id,
           origin: window.location.origin,
         });
         const assistantMsg: Message = {
@@ -413,6 +419,7 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
           sessionId,
           message: content,
           origin: window.location.origin,
+          userId: me?.id,
         }),
       });
 
@@ -886,6 +893,22 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
 
       {/* Input */}
       <div className="p-3 border-t border-gray-100 bg-white shrink-0">
+        {articleId == null && profileSnippet?.text ? (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            <span className="text-[10px] text-gray-400 w-full">结合你的阅读习惯的快捷问法：</span>
+            {profileSnippet.text.split("；").filter(Boolean).map((chip, i) => (
+              <button
+                key={i}
+                type="button"
+                className="rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] text-gray-700 hover:bg-[#e8f0fe] hover:border-[#1677ff]/40"
+                onClick={() => setInput((prev) => (prev ? `${prev} ` : "") + `结合我近期阅读习惯，${chip}，请基于已入库资讯简要说明。`)}
+              >
+                {chip.slice(0, 24)}
+                {chip.length > 24 ? "…" : ""}
+              </button>
+            ))}
+          </div>
+        ) : null}
         <div className="flex gap-2 items-end">
           <Textarea
             ref={textareaRef}

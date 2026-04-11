@@ -64,6 +64,13 @@
       "when": 1776300000000,
       "tag": "0008_news_extracted_line_page_map",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "5",
+      "when": 1776410000000,
+      "tag": "0014_reading_interaction",
+      "breakpoints": true
     }
   ]
 }

@@ -1,5 +1,10 @@
 import type { Express, Request, Response } from "express";
-import { getChatHistory, saveChatMessage } from "../db";
+import {
+  getChatHistory,
+  saveChatMessage,
+  getUserReadingProfile,
+  insertReadingEvent,
+} from "../db";
 import { invokeLLMStream } from "./llm";
 import {
   appendCitedArticleLinks,
@@ -12,6 +17,15 @@ import {
 
 function sendSse(res: Response, obj: Record<string, unknown>) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+async function buildReadingHintText(userId?: number | null): Promise<string> {
+  if (!userId) return "";
+  const p = await getUserReadingProfile(userId);
+  const j = p?.summaryJson as { summaryText?: string } | undefined;
+  const t = j?.summaryText?.trim();
+  if (!t) return "";
+  return `\n【用户阅读习惯摘要】（仅调整表达侧重，事实须来自下文资讯数据）\n${t}`;
 }
 
 /**
@@ -40,9 +54,20 @@ export function registerChatStreamRoute(app: Express) {
     const msg = message.trim().slice(0, 2000);
 
     try {
+      const uid = typeof userId === "number" ? userId : null;
+      if (uid != null) {
+        await insertReadingEvent({
+          userId: uid,
+          sessionId,
+          articleId: null,
+          recordCategory: null,
+          eventType: "chat_ask",
+          payload: { len: msg.length, stream: true },
+        });
+      }
       await saveChatMessage({
         sessionId,
-        userId: typeof userId === "number" ? userId : null,
+        userId: uid,
         role: "user",
         content: msg,
       });
@@ -52,7 +77,7 @@ export function registerChatStreamRoute(app: Express) {
         const fallback = "资讯库未提供与该问题直接相关的信息。";
         await saveChatMessage({
           sessionId,
-          userId: typeof userId === "number" ? userId : null,
+          userId: uid,
           role: "assistant",
           content: fallback,
         });
@@ -64,6 +89,7 @@ export function registerChatStreamRoute(app: Express) {
 
       const newsContext = buildNewsContextBlock(relevantArticles);
       const articleRefMap = buildArticleRefMap(relevantArticles);
+      const readingHint = await buildReadingHintText(uid);
       const history = await getChatHistory(sessionId);
       const historyMessages = history.slice(-10).map((m) => ({
         role: m.role as "user" | "assistant",
@@ -75,7 +101,7 @@ export function registerChatStreamRoute(app: Express) {
         messages: [
           {
             role: "system",
-            content: `${GLOBAL_CHAT_SYSTEM_RULES}
+            content: `${GLOBAL_CHAT_SYSTEM_RULES}${readingHint}
 
 相关资讯数据（供参考）：
 ${newsContext || "（暂无相关资讯）"}`,
@@ -99,7 +125,7 @@ ${newsContext || "（暂无相关资讯）"}`,
 
       await saveChatMessage({
         sessionId,
-        userId: typeof userId === "number" ? userId : null,
+        userId: uid,
         role: "assistant",
         content: withLinks,
       });

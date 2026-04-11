@@ -22,7 +22,12 @@ import {
   InsertTagCorrection,
   briefingSubscriptions,
   InsertBriefingSubscription,
+  articlePdfHighlights,
+  articleReadingImages,
+  readingEvents,
+  userReadingProfiles,
   type NewsArticle,
+  type PdfHighlightRectNorm,
 } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
@@ -712,4 +717,175 @@ export async function toggleBriefingSubscription(
     .update(briefingSubscriptions)
     .set({ isEnabled })
     .where(eq(briefingSubscriptions.id, id));
+}
+
+// ─── PDF 高亮 / 研读图片 / 行为事件 ─────────────────────────────────────────
+
+export async function listPdfHighlightsByArticle(articleId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(articlePdfHighlights)
+    .where(eq(articlePdfHighlights.articleId, articleId))
+    .orderBy(desc(articlePdfHighlights.createdAt));
+}
+
+export async function insertPdfHighlight(data: {
+  articleId: number;
+  userId: number | null;
+  sessionId: string | null;
+  page: number;
+  rectsNorm: PdfHighlightRectNorm[];
+  color?: string | null;
+  note?: string | null;
+}): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.insert(articlePdfHighlights).values({
+    articleId: data.articleId,
+    userId: data.userId ?? undefined,
+    sessionId: data.sessionId ?? undefined,
+    page: data.page,
+    rectsNorm: data.rectsNorm,
+    color: data.color ?? undefined,
+    note: data.note ?? undefined,
+  });
+}
+
+export async function deletePdfHighlight(
+  id: number,
+  userId: number | null,
+  isAdmin: boolean
+): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db
+    .select()
+    .from(articlePdfHighlights)
+    .where(eq(articlePdfHighlights.id, id))
+    .limit(1);
+  const h = rows[0];
+  if (!h) return false;
+  if (!isAdmin && h.userId != null && h.userId !== userId) return false;
+  if (!isAdmin && h.userId == null && userId != null) return false;
+  await db.delete(articlePdfHighlights).where(eq(articlePdfHighlights.id, id));
+  return true;
+}
+
+export async function listReadingImagesByArticle(articleId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(articleReadingImages)
+    .where(eq(articleReadingImages.articleId, articleId))
+    .orderBy(desc(articleReadingImages.createdAt));
+}
+
+export async function insertReadingImage(data: {
+  articleId: number;
+  createdByUserId: number | null;
+  sessionId: string | null;
+  storageKey: string;
+  caption?: string | null;
+  sourcePage?: number | null;
+  sourceRect?: PdfHighlightRectNorm | null;
+}): Promise<number | null> {
+  const db = await getDb();
+  if (!db) return null;
+  await db.insert(articleReadingImages).values({
+    articleId: data.articleId,
+    createdByUserId: data.createdByUserId ?? undefined,
+    sessionId: data.sessionId ?? undefined,
+    storageKey: data.storageKey,
+    caption: data.caption ?? undefined,
+    sourcePage: data.sourcePage ?? undefined,
+    sourceRect: data.sourceRect ?? undefined,
+  });
+  const row = await db
+    .select({ id: articleReadingImages.id })
+    .from(articleReadingImages)
+    .where(eq(articleReadingImages.articleId, data.articleId))
+    .orderBy(desc(articleReadingImages.id))
+    .limit(1);
+  return row[0]?.id ?? null;
+}
+
+export async function insertReadingEvent(data: {
+  userId: number | null;
+  sessionId: string | null;
+  articleId: number | null;
+  recordCategory: string | null;
+  eventType: string;
+  payload: Record<string, unknown> | null;
+}) {
+  const db = await getDb();
+  if (!db) return;
+  try {
+    await db.insert(readingEvents).values({
+      userId: data.userId ?? undefined,
+      sessionId: data.sessionId ?? undefined,
+      articleId: data.articleId ?? undefined,
+      recordCategory: data.recordCategory ?? undefined,
+      eventType: data.eventType,
+      payload: data.payload ?? undefined,
+    });
+  } catch (e) {
+    console.warn("[insertReadingEvent]", e);
+  }
+}
+
+export async function getUserReadingProfile(userId: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const rows = await db
+    .select()
+    .from(userReadingProfiles)
+    .where(eq(userReadingProfiles.userId, userId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export async function upsertUserReadingProfile(
+  userId: number,
+  summaryJson: Record<string, unknown>
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db
+    .insert(userReadingProfiles)
+    .values({ userId, summaryJson })
+    .onDuplicateKeyUpdate({ set: { summaryJson, updatedAt: new Date() } });
+}
+
+/** 按最近事件聚合为简短画像（供 chat 注入，非原始流水） */
+export async function rollupUserReadingProfile(userId: number): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  const since = new Date();
+  since.setDate(since.getDate() - 30);
+  const rows = await db
+    .select({
+      eventType: readingEvents.eventType,
+      c: sql<number>`count(*)`.mapWith(Number),
+    })
+    .from(readingEvents)
+    .where(and(eq(readingEvents.userId, userId), gte(readingEvents.createdAt, since)))
+    .groupBy(readingEvents.eventType);
+  const counts: Record<string, number> = {};
+  for (const r of rows) counts[r.eventType] = r.c;
+  const parts: string[] = [];
+  if ((counts.article_open ?? 0) > 3) parts.push("近期频繁打开资讯/报告详情");
+  if ((counts.citation_locate ?? 0) > 2) parts.push("多次使用助手引用定位到原文");
+  if ((counts.pdf_highlight_save ?? 0) > 1) parts.push("有在 PDF 上保存团队高亮");
+  if ((counts.reading_image_save ?? 0) > 0) parts.push("有保存重点图片到图片流");
+  if ((counts.chat_ask ?? 0) > 5) parts.push("与助手问答较活跃");
+  const summaryText =
+    parts.length > 0 ? parts.join("；") : "近期研读行为较少，暂无显著偏好信号";
+  await upsertUserReadingProfile(userId, {
+    counts,
+    summaryText,
+    rolledUpAt: new Date().toISOString(),
+  });
 }

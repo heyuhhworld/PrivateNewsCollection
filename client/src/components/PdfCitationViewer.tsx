@@ -6,6 +6,8 @@ import {
   type PDFPageProxy,
   type PageViewport,
 } from "pdfjs-dist";
+import { TextLayerBuilder } from "pdfjs-dist/web/pdf_viewer.mjs";
+import "pdfjs-dist/web/pdf_viewer.css";
 
 type PdfTextItem = {
   str: string;
@@ -14,8 +16,9 @@ type PdfTextItem = {
   height: number;
 };
 import workerSrc from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import { cn } from "@/lib/utils";
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { ChevronLeft, ChevronRight, Highlighter, ImageIcon } from "lucide-react";
+import { trpc } from "@/lib/trpc";
+import { toast } from "sonner";
 
 GlobalWorkerOptions.workerSrc = workerSrc;
 
@@ -26,20 +29,24 @@ export type PdfCitationHighlight = {
   quote?: string;
 };
 
+export type PersistedPdfHighlight = {
+  id: number;
+  page: number;
+  rectsNorm: { x: number; y: number; w: number; h: number }[];
+  color: string | null;
+};
+
 type Props = {
   url: string;
   page: number;
   onPageChange: (p: number) => void;
   citationHighlight: PdfCitationHighlight | null;
-  /** 与 chat / 抽取正文一致的非空行，用于在 PDF 文本层中匹配高亮 */
   citationLines: string[];
+  articleId?: number;
+  sessionId?: string;
+  persistedHighlights?: PersistedPdfHighlight[];
 };
 
-/**
- * Normalize text for fuzzy PDF matching:
- * - collapse whitespace, strip soft hyphens / zero-width chars
- * - replace fancy quotes / dashes with ASCII equivalents
- */
 function normalizeForMatch(s: string): string {
   return s
     .replace(/[\u00AD\u200B\u200C\u200D\uFEFF]/g, "")
@@ -51,10 +58,6 @@ function normalizeForMatch(s: string): string {
     .trim();
 }
 
-/**
- * Build regex patterns from a quote string, progressively relaxed.
- * Returns array of patterns to try (most specific first).
- */
 function buildSearchPatterns(needleRaw: string): RegExp[] {
   const norm = normalizeForMatch(needleRaw);
   if (!norm) return [];
@@ -143,10 +146,6 @@ async function findHighlightRects(
 
 type Rect = { left: number; top: number; width: number; height: number };
 
-/**
- * Group raw per-item rects into clean line-spanning highlight bands.
- * Items on the same baseline (within yTol px) are merged into one wide rect.
- */
 function mergeIntoLineRects(rects: Rect[], pageWidth: number): Rect[] {
   if (rects.length === 0) return [];
 
@@ -213,26 +212,81 @@ function rectsForRange(
   return mergeIntoLineRects(raw, viewport.width);
 }
 
+function normRectsToPixels(
+  rects: { x: number; y: number; w: number; h: number }[],
+  vw: number,
+  vh: number
+): Rect[] {
+  return rects.map((r) => ({
+    left: r.x * vw,
+    top: r.y * vh,
+    width: r.w * vw,
+    height: r.h * vh,
+  }));
+}
+
+function selectionToNormRects(
+  pageBox: HTMLElement,
+  vw: number,
+  vh: number
+): { x: number; y: number; w: number; h: number }[] | null {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+  const range = sel.getRangeAt(0);
+  if (!pageBox.contains(range.commonAncestorContainer)) return null;
+  const br = pageBox.getBoundingClientRect();
+  const rects = Array.from(range.getClientRects());
+  const out: { x: number; y: number; w: number; h: number }[] = [];
+  for (const r of rects) {
+    if (r.width < 2 && r.height < 2) continue;
+    const left = r.left - br.left;
+    const top = r.top - br.top;
+    if (left < -2 || top < -2 || left > vw + 2 || top > vh + 2) continue;
+    out.push({
+      x: Math.max(0, Math.min(1, left / vw)),
+      y: Math.max(0, Math.min(1, top / vh)),
+      w: Math.max(0, Math.min(1, r.width / vw)),
+      h: Math.max(0, Math.min(1, r.height / vh)),
+    });
+  }
+  return out.length ? out : null;
+}
+
 export function PdfCitationViewer({
   url,
   page,
   onPageChange,
   citationHighlight,
   citationLines,
+  articleId,
+  sessionId,
+  persistedHighlights = [],
 }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const pageBoxRef = useRef<HTMLDivElement>(null);
+  const textLayerHostRef = useRef<HTMLDivElement>(null);
+  const textLayerBuilderRef = useRef<TextLayerBuilder | null>(null);
+
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
   const [numPages, setNumPages] = useState(0);
   const [loadErr, setLoadErr] = useState<string | null>(null);
-  const [highlightRects, setHighlightRects] = useState<
-    { left: number; top: number; width: number; height: number }[]
-  >([]);
+  const [highlightRects, setHighlightRects] = useState<Rect[]>([]);
   const [renderTick, setRenderTick] = useState(0);
   const [canvasCssSize, setCanvasCssSize] = useState({ w: 0, h: 0 });
 
   const renderTaskRef = useRef<{ cancel: () => void } | null>(null);
   const renderGenRef = useRef(0);
+
+  const utils = trpc.useUtils();
+  const saveHighlightMut = trpc.reading.pdfHighlightCreate.useMutation({
+    onSuccess: () => {
+      toast.success("已保存团队高亮");
+      if (articleId) void utils.reading.pdfHighlightsList.invalidate({ articleId });
+      window.getSelection()?.removeAllRanges();
+    },
+    onError: (e) => toast.error(e.message),
+  });
 
   const safePage = Math.min(Math.max(1, page), Math.max(1, numPages || 1));
 
@@ -310,6 +364,29 @@ export function PdfCitationViewer({
       renderTaskRef.current = null;
 
       if (gen !== renderGenRef.current) return;
+
+      const host = textLayerHostRef.current;
+      if (host) {
+        textLayerBuilderRef.current?.cancel();
+        textLayerBuilderRef.current = null;
+        host.replaceChildren();
+        const tlb = new TextLayerBuilder({ pdfPage: p });
+        textLayerBuilderRef.current = tlb;
+        await tlb.render({ viewport });
+        if (gen !== renderGenRef.current) {
+          tlb.cancel();
+          return;
+        }
+        host.appendChild(tlb.div);
+        const div = tlb.div;
+        div.style.position = "absolute";
+        div.style.left = "0";
+        div.style.top = "0";
+        div.style.width = `${viewport.width}px`;
+        div.style.height = `${viewport.height}px`;
+      }
+
+      if (gen !== renderGenRef.current) return;
       return { p, viewport };
     },
     []
@@ -345,16 +422,19 @@ export function PdfCitationViewer({
         )
         .join(" ");
 
-      let rects = quoteFromLlm
-        ? await findHighlightRects(p, viewport, quoteFromLlm)
-        : [];
-      if (rects.length === 0 && quoteFromLines) {
-        rects = await findHighlightRects(p, viewport, quoteFromLines);
+      let citeRects: Rect[] = [];
+      if (quoteFromLlm) {
+        citeRects = await findHighlightRects(p, viewport, quoteFromLlm);
       }
-      if (alive) setHighlightRects(rects);
+      if (citeRects.length === 0 && quoteFromLines) {
+        citeRects = await findHighlightRects(p, viewport, quoteFromLines);
+      }
+      if (alive) setHighlightRects(citeRects);
     })();
     return () => {
       alive = false;
+      textLayerBuilderRef.current?.cancel();
+      textLayerBuilderRef.current = null;
     };
   }, [
     pdfDoc,
@@ -381,6 +461,65 @@ export function PdfCitationViewer({
     };
   }, []);
 
+  const handleSaveHighlight = () => {
+    if (!articleId) {
+      toast.message("仅在对已入库文章预览时可保存高亮");
+      return;
+    }
+    const box = pageBoxRef.current;
+    if (!box || canvasCssSize.w < 10 || canvasCssSize.h < 10) return;
+    const norms = selectionToNormRects(box, canvasCssSize.w, canvasCssSize.h);
+    if (!norms) {
+      toast.message("请先在 PDF 文本上划选一段内容");
+      return;
+    }
+    saveHighlightMut.mutate({
+      articleId,
+      page: safePage,
+      rectsNorm: norms,
+      sessionId: sessionId ?? undefined,
+    });
+  };
+
+  const handleSavePageImage = () => {
+    if (!articleId) {
+      toast.message("仅在对已入库文章预览时可存图");
+      return;
+    }
+    const canvas = canvasRef.current;
+    if (!canvas || canvas.width < 2) return;
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          toast.error("导出图片失败");
+          return;
+        }
+        const fd = new FormData();
+        fd.append("file", blob, "page.png");
+        fd.append("articleId", String(articleId));
+        fd.append("sourcePage", String(safePage));
+        if (sessionId) fd.append("sessionId", sessionId);
+        fetch("/api/news/reading-image", {
+          method: "POST",
+          body: fd,
+          credentials: "include",
+        })
+          .then(async (r) => {
+            const j = (await r.json().catch(() => ({}))) as {
+              error?: string;
+              success?: boolean;
+            };
+            if (!r.ok) throw new Error(j.error || r.statusText);
+            toast.success("已加入图片流");
+            void utils.reading.readingImagesList.invalidate({ articleId });
+          })
+          .catch((e: Error) => toast.error(e.message));
+      },
+      "image/png",
+      0.92
+    );
+  };
+
   if (loadErr) {
     return (
       <div className="flex flex-1 min-h-[200px] items-center justify-center rounded-lg border border-red-200 bg-red-50/80 px-4 text-center text-xs text-red-800">
@@ -398,9 +537,17 @@ export function PdfCitationViewer({
     );
   }
 
+  const vw = canvasCssSize.w;
+  const vh = canvasCssSize.h;
+  const persistedForPage = persistedHighlights.filter((h) => h.page === safePage);
+  const persistedPixelRects: Rect[] = [];
+  for (const ph of persistedForPage) {
+    persistedPixelRects.push(...normRectsToPixels(ph.rectsNorm, vw, vh));
+  }
+
   return (
     <div className="flex flex-1 min-h-0 flex-col gap-2">
-      <div className="flex shrink-0 items-center justify-between gap-2 px-1">
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 px-1">
         <div className="flex items-center gap-1">
           <button
             type="button"
@@ -424,28 +571,71 @@ export function PdfCitationViewer({
             <ChevronRight className="h-4 w-4" />
           </button>
         </div>
-        {citationHighlight && highlightRects.length > 0 ? (
-          <span className="text-[11px] text-amber-800">已在正文上高亮引用片段</span>
-        ) : citationHighlight ? (
-          <span className="text-[11px] text-gray-400">未匹配到精确字形位置（见下方摘录）</span>
-        ) : null}
+        <div className="flex flex-wrap items-center gap-1.5">
+          {articleId ? (
+            <>
+              <button
+                type="button"
+                disabled={saveHighlightMut.isPending}
+                onClick={handleSaveHighlight}
+                className="inline-flex items-center gap-1 rounded border border-amber-200 bg-amber-50/90 px-2 py-1 text-[11px] font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+              >
+                <Highlighter className="h-3 w-3" />
+                保存选区为团队高亮
+              </button>
+              <button
+                type="button"
+                onClick={handleSavePageImage}
+                className="inline-flex items-center gap-1 rounded border border-sky-200 bg-sky-50/90 px-2 py-1 text-[11px] font-medium text-sky-900 hover:bg-sky-100"
+              >
+                <ImageIcon className="h-3 w-3" />
+                本页存图
+              </button>
+            </>
+          ) : null}
+          {citationHighlight && highlightRects.length > 0 ? (
+            <span className="text-[11px] text-amber-800">已高亮引用</span>
+          ) : citationHighlight ? (
+            <span className="text-[11px] text-gray-400">未匹配到引用字形高亮</span>
+          ) : null}
+        </div>
       </div>
       <div
         ref={wrapRef}
         className="relative flex min-h-[200px] flex-1 justify-center overflow-auto rounded-lg border border-gray-200 bg-neutral-700/5"
       >
-        <div className="relative inline-block">
-          <canvas ref={canvasRef} className="block max-w-full shadow-sm" />
+        <div
+          ref={pageBoxRef}
+          className="relative inline-block shadow-sm"
+          style={
+            vw > 0 && vh > 0
+              ? { width: vw, minHeight: vh }
+              : { minWidth: 200, minHeight: 200 }
+          }
+        >
+          <canvas ref={canvasRef} className="block max-w-full" />
           <div
-            className="pointer-events-none absolute left-0 top-0"
-            style={{
-              width: canvasCssSize.w,
-              height: canvasCssSize.h,
-            }}
+            className="pointer-events-none absolute left-0 top-0 z-[5]"
+            style={{ width: vw || undefined, height: vh || undefined }}
           >
+            {persistedPixelRects.map((r, i) => (
+              <div
+                key={`p-${i}`}
+                className="absolute rounded-[2px]"
+                style={{
+                  left: r.left,
+                  top: r.top,
+                  width: r.width,
+                  height: Math.max(r.height, 8),
+                  background: "rgba(52, 211, 153, 0.35)",
+                  boxShadow: "0 0 0 1px rgba(16, 185, 129, 0.45)",
+                  mixBlendMode: "multiply",
+                }}
+              />
+            ))}
             {highlightRects.map((r, i) => (
               <div
-                key={i}
+                key={`c-${i}`}
                 className="absolute rounded-[3px]"
                 style={{
                   left: r.left,
@@ -459,6 +649,14 @@ export function PdfCitationViewer({
               />
             ))}
           </div>
+          <div
+            ref={textLayerHostRef}
+            className="absolute left-0 top-0 z-[10]"
+            style={{
+              width: vw || "100%",
+              height: vh || "100%",
+            }}
+          />
         </div>
       </div>
     </div>

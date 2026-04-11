@@ -11,6 +11,7 @@ import { chatRouter } from "./routers/chat";
 import { crawlRouter } from "./routers/crawl";
 import { briefingRouter } from "./routers/briefing";
 import { knowledgeGraphRouter } from "./routers/knowledgeGraph";
+import { readingRouter } from "./routers/reading";
 
 export const appRouter = router({
   system: systemRouter,
@@ -110,6 +111,7 @@ export const appRouter = router({
   crawl: crawlRouter,
   briefing: briefingRouter,
   kg: knowledgeGraphRouter,
+  reading: readingRouter,
 });
 
 export type AppRouter = typeof appRouter;

@@ -27,7 +27,10 @@ import { Streamdown } from "streamdown";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
 import { cn } from "@/lib/utils";
-import { PdfCitationViewer } from "@/components/PdfCitationViewer";
+import {
+  PdfCitationViewer,
+  type PersistedPdfHighlight,
+} from "@/components/PdfCitationViewer";
 
 // 获取或生成持久化的 sessionId
 function getSessionId(): string {
@@ -118,6 +121,30 @@ export default function NewsDetail() {
     { enabled: id > 0 }
   );
 
+  const isPdf = Boolean(article && String(article.attachmentMime ?? "").toLowerCase().includes("pdf"));
+
+  const { data: pdfHighlights } = trpc.reading.pdfHighlightsList.useQuery(
+    { articleId: id },
+    { enabled: id > 0 && isPdf }
+  );
+
+  const { data: readingImages } = trpc.reading.readingImagesList.useQuery(
+    { articleId: id },
+    { enabled: id > 0 && isPdf }
+  );
+
+  const logReadingEvent = trpc.reading.logEvent.useMutation();
+
+  const persistedPdfHighlights = useMemo((): PersistedPdfHighlight[] => {
+    if (!pdfHighlights?.length) return [];
+    return pdfHighlights.map((h) => ({
+      id: h.id,
+      page: h.page,
+      rectsNorm: (h.rectsNorm as PersistedPdfHighlight["rectsNorm"]) ?? [],
+      color: h.color ?? null,
+    }));
+  }, [pdfHighlights]);
+
   const utils = trpc.useUtils();
   const correctTagsMutation = trpc.news.correctTags.useMutation({
     onSuccess: () => {
@@ -157,6 +184,7 @@ export default function NewsDetail() {
   const markRead = trpc.news.markRead.useMutation();
   const recordView = trpc.news.recordView.useMutation();
   const lastRecordedViewId = useRef<number | null>(null);
+  const articleOpenLoggedRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (article && !article.isRead) {
@@ -170,6 +198,18 @@ export default function NewsDetail() {
     lastRecordedViewId.current = article.id;
     recordView.mutate({ id: article.id });
   }, [article?.id]);
+
+  useEffect(() => {
+    if (!article?.id) return;
+    if (articleOpenLoggedRef.current === article.id) return;
+    articleOpenLoggedRef.current = article.id;
+    logReadingEvent.mutate({
+      articleId: article.id,
+      sessionId,
+      eventType: "article_open",
+      recordCategory: article.recordCategory ?? undefined,
+    });
+  }, [article?.id, article?.recordCategory, sessionId]);
 
   const handleBookmarkToggle = () => {
     if (bookmarked) {
@@ -248,6 +288,12 @@ export default function NewsDetail() {
         quote?: string;
       }>).detail;
       if (!detail || detail.articleId !== id) return;
+      logReadingEvent.mutate({
+        articleId: id,
+        sessionId,
+        eventType: "citation_locate",
+        payload: { page: detail.page, startLine: detail.startLine },
+      });
       const startLine = Math.max(1, detail.startLine || 1);
       const endLine = Math.max(startLine, detail.endLine || startLine);
       const map = extractedLinePageMap;
@@ -279,7 +325,7 @@ export default function NewsDetail() {
     window.addEventListener("ipms-locate-reference", onLocate as EventListener);
     return () =>
       window.removeEventListener("ipms-locate-reference", onLocate as EventListener);
-  }, [id, isPdfPreview, extractedLinePageMap]);
+  }, [id, isPdfPreview, extractedLinePageMap, sessionId]);
 
   useEffect(() => {
     if (!citationHighlight) return;
@@ -605,8 +651,33 @@ export default function NewsDetail() {
                 onPageChange={setPdfPage}
                 citationHighlight={citationHighlight}
                 citationLines={citationLines}
+                articleId={id}
+                sessionId={sessionId}
+                persistedHighlights={persistedPdfHighlights}
               />
             </div>
+            {readingImages && readingImages.length > 0 ? (
+              <div className="shrink-0 rounded-lg border border-gray-200 bg-white p-2">
+                <div className="mb-1 text-[11px] font-medium text-gray-600">图片流（团队共享）</div>
+                <div className="flex gap-2 overflow-x-auto pb-1">
+                  {readingImages.map((img) => (
+                    <a
+                      key={img.id}
+                      href={`/uploads/news/${img.storageKey}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="shrink-0"
+                    >
+                      <img
+                        src={`/uploads/news/${img.storageKey}`}
+                        alt={img.caption ?? ""}
+                        className="h-20 w-auto max-w-[140px] rounded border border-gray-100 object-contain"
+                      />
+                    </a>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </>
         ) : (
           <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-gray-200 bg-white p-3">

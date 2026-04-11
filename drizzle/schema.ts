@@ -233,3 +233,62 @@ export const briefingSubscriptions = mysqlTable("briefing_subscriptions", {
 });
 export type BriefingSubscription = typeof briefingSubscriptions.$inferSelect;
 export type InsertBriefingSubscription = typeof briefingSubscriptions.$inferInsert;
+
+/** PDF 上用户持久化高亮（归一化矩形，团队同文可见） */
+export type PdfHighlightRectNorm = { x: number; y: number; w: number; h: number };
+
+export const articlePdfHighlights = mysqlTable("article_pdf_highlights", {
+  id: int("id").autoincrement().primaryKey(),
+  articleId: int("articleId").notNull(),
+  userId: int("userId"),
+  sessionId: varchar("sessionId", { length: 64 }),
+  page: int("page").notNull(),
+  rectsNorm: json("rectsNorm").$type<PdfHighlightRectNorm[]>().notNull(),
+  color: varchar("color", { length: 32 }).default("#fde047"),
+  note: text("note"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type ArticlePdfHighlight = typeof articlePdfHighlights.$inferSelect;
+export type InsertArticlePdfHighlight = typeof articlePdfHighlights.$inferInsert;
+
+/** 报告/资讯研读剪藏图片（团队同文可见） */
+export const articleReadingImages = mysqlTable("article_reading_images", {
+  id: int("id").autoincrement().primaryKey(),
+  articleId: int("articleId").notNull(),
+  createdByUserId: int("createdByUserId"),
+  sessionId: varchar("sessionId", { length: 64 }),
+  storageKey: varchar("storageKey", { length: 512 }).notNull(),
+  caption: text("caption"),
+  sourcePage: int("sourcePage"),
+  sourceRect: json("sourceRect").$type<PdfHighlightRectNorm | null>(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type ArticleReadingImage = typeof articleReadingImages.$inferSelect;
+export type InsertArticleReadingImage = typeof articleReadingImages.$inferInsert;
+
+/** 轻量研读行为事件（用于汇总画像，不直传原始流水进 LLM） */
+export const readingEvents = mysqlTable("reading_events", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId"),
+  sessionId: varchar("sessionId", { length: 64 }),
+  articleId: int("articleId"),
+  recordCategory: varchar("recordCategory", { length: 32 }),
+  eventType: varchar("eventType", { length: 64 }).notNull(),
+  payload: json("payload").$type<Record<string, unknown> | null>(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type ReadingEvent = typeof readingEvents.$inferSelect;
+export type InsertReadingEvent = typeof readingEvents.$inferInsert;
+
+/** 用户阅读习惯汇总（由 reading_events rollup） */
+export const userReadingProfiles = mysqlTable("user_reading_profiles", {
+  userId: int("userId").notNull().primaryKey(),
+  summaryJson: json("summaryJson").$type<Record<string, unknown>>().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type UserReadingProfile = typeof userReadingProfiles.$inferSelect;
+export type InsertUserReadingProfile = typeof userReadingProfiles.$inferInsert;
