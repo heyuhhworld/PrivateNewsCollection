@@ -652,6 +652,16 @@ export default function News() {
               <p className="text-xs text-red-600/90 mt-2 max-w-lg break-words">
                 {error?.message ?? "未知错误"}
               </p>
+              {/failed to fetch|load failed|networkerror/i.test(
+                String(error?.message ?? "")
+              ) ? (
+                <p className="text-xs text-amber-800 mt-3 max-w-md leading-relaxed rounded border border-amber-100 bg-amber-50/80 px-2 py-1.5">
+                  这通常表示<strong>浏览器没连上本机后端</strong>（不是数据库缺列）。请确认终端里已运行{" "}
+                  <code className="rounded bg-white px-1">pnpm dev</code>，并用{" "}
+                  <code className="rounded bg-white px-1">http://localhost:3000</code>{" "}
+                  打开本站后再试；若端口不是 3000，请与终端里「Server running on …」一致。
+                </p>
+              ) : null}
               <p className="text-xs text-gray-500 mt-4 max-w-md leading-relaxed">
                 若错误中含 Unknown column，说明数据库结构与代码不一致。请在项目根目录执行{" "}
                 <code className="rounded bg-gray-100 px-1 py-0.5">pnpm run db:ensure-schema</code>{" "}
