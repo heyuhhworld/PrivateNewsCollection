@@ -1,0 +1,17 @@
+# ── 本地 MySQL 说明（重要）────────────────────────────────────────────
+#
+# 本仓库 **不再** 通过 Compose 启动第二个 MySQL，避免与本机已有实例抢 3306、
+# 以及「空库 ipms」与真实数据「ipms_local」混用连错。
+#
+# 请使用你已有的 MySQL 容器（例如 Docker Desktop 里的 ipms-local-mysql），
+# 并在项目根目录 .env 中配置 DATABASE_URL（示例见 .env.example）。
+#
+# 若容器已存在但未运行：docker start ipms-local-mysql
+#
+# 历史说明：曾在此文件中定义 ipms-mysql（库 ipms / 空数据），已与真实库混淆；
+# 该服务已移除。若本地仍残留同名容器或匿名卷，可自行 docker rm / docker volume prune。
+# ────────────────────────────────────────────────────────────────────
+
+name: ipms-system
+
+services: {}
