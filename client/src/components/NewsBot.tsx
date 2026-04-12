@@ -148,8 +148,15 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
 
   const utils = trpc.useUtils();
   const { data: me } = trpc.auth.me.useQuery();
+  const [readingChipsDismissed, setReadingChipsDismissed] = useState(() => {
+    try {
+      return localStorage.getItem("ipms_reading_chips_hidden") === "1";
+    } catch {
+      return false;
+    }
+  });
   const { data: profileSnippet } = trpc.reading.profileSnippet.useQuery(undefined, {
-    enabled: articleId == null && !!me?.id,
+    enabled: articleId == null && !!me?.id && !readingChipsDismissed,
     staleTime: 120_000,
   });
   const sendMutation = trpc.chat.send.useMutation();
@@ -893,9 +900,11 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
 
       {/* Input */}
       <div className="p-3 border-t border-gray-100 bg-white shrink-0">
-        {articleId == null && profileSnippet?.text ? (
-          <div className="mb-2 flex flex-wrap gap-1.5">
-            <span className="text-[10px] text-gray-400 w-full">结合你的阅读习惯的快捷问法：</span>
+        {articleId == null && !readingChipsDismissed && profileSnippet?.text ? (
+          <div className="mb-2 flex flex-wrap items-center gap-1.5">
+            <span className="text-[10px] text-gray-400 w-full sm:w-auto shrink-0">
+              结合你的阅读习惯的快捷问法：
+            </span>
             {profileSnippet.text.split("；").filter(Boolean).map((chip, i) => (
               <button
                 key={i}
@@ -907,6 +916,20 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
                 {chip.length > 24 ? "…" : ""}
               </button>
             ))}
+            <button
+              type="button"
+              className="text-[10px] text-gray-400 underline decoration-dotted hover:text-gray-600"
+              onClick={() => {
+                try {
+                  localStorage.setItem("ipms_reading_chips_hidden", "1");
+                } catch {
+                  /* ignore */
+                }
+                setReadingChipsDismissed(true);
+              }}
+            >
+              不再显示
+            </button>
           </div>
         ) : null}
         <div className="flex gap-2 items-end">

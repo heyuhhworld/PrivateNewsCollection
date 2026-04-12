@@ -85,12 +85,18 @@ export const readingRouter = router({
     }),
 
   pdfHighlightDelete: publicProcedure
-    .input(z.object({ id: z.number().int() }))
+    .input(
+      z.object({
+        id: z.number().int(),
+        sessionId: z.string().max(64).optional(),
+      })
+    )
     .mutation(async ({ input, ctx }) => {
       const ok = await deletePdfHighlight(
         input.id,
         ctx.user?.id ?? null,
-        ctx.user?.role === "admin"
+        ctx.user?.role === "admin",
+        input.sessionId ?? null
       );
       if (!ok) {
         throw new TRPCError({ code: "FORBIDDEN", message: "无权删除该高亮" });

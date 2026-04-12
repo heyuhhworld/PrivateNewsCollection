@@ -211,6 +211,22 @@ export default function NewsDetail() {
     });
   }, [article?.id, article?.recordCategory, sessionId]);
 
+  /** PDF 详情页停留：约每 10s 合并一条，仅前台可见时累计（节流，避免流水过大） */
+  useEffect(() => {
+    if (!article?.id || !isPdf) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      logReadingEvent.mutate({
+        articleId: article.id,
+        sessionId,
+        eventType: "dwell_tick",
+        recordCategory: article.recordCategory ?? undefined,
+        payload: { dwellSec: 10 },
+      });
+    }, 10_000);
+    return () => clearInterval(timer);
+  }, [article?.id, article?.recordCategory, sessionId, isPdf]);
+
   const handleBookmarkToggle = () => {
     if (bookmarked) {
       removeBookmark.mutate({ articleId: id, sessionId });

@@ -274,6 +274,8 @@ export function PdfCitationViewer({
   const [highlightRects, setHighlightRects] = useState<Rect[]>([]);
   const [renderTick, setRenderTick] = useState(0);
   const [canvasCssSize, setCanvasCssSize] = useState({ w: 0, h: 0 });
+  /** 当前页是否存在可选中文本（扫描版 PDF 常为 false） */
+  const [pageHasSelectableText, setPageHasSelectableText] = useState<boolean | null>(null);
 
   const renderTaskRef = useRef<{ cancel: () => void } | null>(null);
   const renderGenRef = useRef(0);
@@ -395,10 +397,23 @@ export function PdfCitationViewer({
   useEffect(() => {
     if (!pdfDoc || numPages < 1) return;
     let alive = true;
+    setPageHasSelectableText(null);
     (async () => {
       const meta = await renderPage(pdfDoc, safePage);
       if (!alive || !meta) return;
       const { p, viewport } = meta;
+
+      try {
+        const textContent = await p.getTextContent();
+        const hasText = textContent.items.some((it) => {
+          if (!it || typeof it !== "object" || !("str" in it)) return false;
+          const s = String((it as { str?: string }).str ?? "").trim();
+          return s.length > 0;
+        });
+        if (alive) setPageHasSelectableText(hasText);
+      } catch {
+        if (alive) setPageHasSelectableText(false);
+      }
 
       if (!citationHighlight) {
         setHighlightRects([]);
@@ -600,6 +615,20 @@ export function PdfCitationViewer({
           ) : null}
         </div>
       </div>
+      {pageHasSelectableText === false && numPages > 0 ? (
+        <div className="shrink-0 rounded border border-amber-100 bg-amber-50/90 px-2 py-1.5 text-[11px] leading-snug text-amber-950">
+          该 PDF 可能为扫描件，无可选中文本层，划词保存高亮可能不可用。仍可浏览页面或使用
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mx-1 text-[#1677ff] underline"
+          >
+            新窗口打开
+          </a>
+          下载后本地查看。
+        </div>
+      ) : null}
       <div
         ref={wrapRef}
         className="relative flex min-h-[200px] flex-1 justify-center overflow-auto rounded-lg border border-gray-200 bg-neutral-700/5"

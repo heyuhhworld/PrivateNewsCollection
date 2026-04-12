@@ -1,3 +1,5 @@
+import fs from "fs";
+import path from "path";
 import { and, desc, eq, gte, inArray, isNotNull, like, lte, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
@@ -399,6 +401,20 @@ export async function adminSetNewsArticleHidden(id: number, isHidden: boolean) {
 export async function adminDeleteNewsArticle(id: number) {
   const db = await getDb();
   if (!db) return;
+  const imgs = await db
+    .select({ storageKey: articleReadingImages.storageKey })
+    .from(articleReadingImages)
+    .where(eq(articleReadingImages.articleId, id));
+  const uploadsNewsBase = path.resolve(process.cwd(), "uploads", "news");
+  for (const row of imgs) {
+    if (!row.storageKey || row.storageKey.includes("..")) continue;
+    const abs = path.resolve(uploadsNewsBase, row.storageKey);
+    if (!abs.startsWith(uploadsNewsBase + path.sep) && abs !== uploadsNewsBase) continue;
+    fs.unlink(abs, () => {});
+  }
+  await db.delete(articlePdfHighlights).where(eq(articlePdfHighlights.articleId, id));
+  await db.delete(articleReadingImages).where(eq(articleReadingImages.articleId, id));
+  await db.delete(readingEvents).where(eq(readingEvents.articleId, id));
   await db.delete(bookmarks).where(eq(bookmarks.articleId, id));
   await db.delete(newsArticles).where(eq(newsArticles.id, id));
 }
@@ -756,7 +772,8 @@ export async function insertPdfHighlight(data: {
 export async function deletePdfHighlight(
   id: number,
   userId: number | null,
-  isAdmin: boolean
+  isAdmin: boolean,
+  sessionId?: string | null
 ): Promise<boolean> {
   const db = await getDb();
   if (!db) return false;
@@ -767,8 +784,17 @@ export async function deletePdfHighlight(
     .limit(1);
   const h = rows[0];
   if (!h) return false;
-  if (!isAdmin && h.userId != null && h.userId !== userId) return false;
-  if (!isAdmin && h.userId == null && userId != null) return false;
+  if (isAdmin) {
+    await db.delete(articlePdfHighlights).where(eq(articlePdfHighlights.id, id));
+    return true;
+  }
+  if (h.userId != null) {
+    if (userId == null || h.userId !== userId) return false;
+  } else {
+    const sid = (sessionId ?? "").trim();
+    const hs = (h.sessionId ?? "").trim();
+    if (!sid || !hs || sid !== hs) return false;
+  }
   await db.delete(articlePdfHighlights).where(eq(articlePdfHighlights.id, id));
   return true;
 }
@@ -881,6 +907,7 @@ export async function rollupUserReadingProfile(userId: number): Promise<void> {
   if ((counts.pdf_highlight_save ?? 0) > 1) parts.push("有在 PDF 上保存团队高亮");
   if ((counts.reading_image_save ?? 0) > 0) parts.push("有保存重点图片到图片流");
   if ((counts.chat_ask ?? 0) > 5) parts.push("与助手问答较活跃");
+  if ((counts.dwell_tick ?? 0) > 12) parts.push("常在报告/PDF 详情页停留较久");
   const summaryText =
     parts.length > 0 ? parts.join("；") : "近期研读行为较少，暂无显著偏好信号";
   await upsertUserReadingProfile(userId, {
