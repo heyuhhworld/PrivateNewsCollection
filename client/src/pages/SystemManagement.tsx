@@ -376,9 +376,14 @@ export default function SystemManagement() {
           });
         }
       } catch (e: unknown) {
+        let msg = e instanceof Error ? e.message : "执行失败";
+        if (/failed to fetch|load failed|networkerror/i.test(msg)) {
+          msg =
+            "无法连接后端（请确认终端已运行 pnpm dev，并用终端里「Server running on …」同一地址打开本站后再上传）";
+        }
         patchImportRow(row.id, {
           status: "failed",
-          error: e instanceof Error ? e.message : "执行失败",
+          error: msg,
         });
       }
     };
