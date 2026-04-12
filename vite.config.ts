@@ -150,7 +150,32 @@ function vitePluginManusDebugCollector(): Plugin {
   };
 }
 
-const plugins = [react(), tailwindcss(), jsxLocPlugin(), vitePluginManusRuntime(), vitePluginManusDebugCollector()];
+/** 将 pdfjs worker 拷到 client/public，避免 dev 下 ?url 变成 @fs/... 导致浏览器无法加载 */
+function ensurePdfjsWorkerPublic(): Plugin {
+  const src = path.join(PROJECT_ROOT, "node_modules/pdfjs-dist/build/pdf.worker.min.mjs");
+  const dest = path.join(PROJECT_ROOT, "client", "public", "pdf.worker.min.mjs");
+  return {
+    name: "ensure-pdfjs-worker-public",
+    buildStart() {
+      try {
+        if (!fs.existsSync(src)) return;
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(src, dest);
+      } catch (e) {
+        console.warn("[ensure-pdfjs-worker-public]", e);
+      }
+    },
+  };
+}
+
+const plugins = [
+  react(),
+  tailwindcss(),
+  jsxLocPlugin(),
+  vitePluginManusRuntime(),
+  vitePluginManusDebugCollector(),
+  ensurePdfjsWorkerPublic(),
+];
 
 export default defineConfig({
   plugins,

@@ -15,12 +15,12 @@ type PdfTextItem = {
   width: number;
   height: number;
 };
-import workerSrc from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { ChevronLeft, ChevronRight, Highlighter, ImageIcon } from "lucide-react";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 
-GlobalWorkerOptions.workerSrc = workerSrc;
+/** 由 vite 插件从 node_modules 拷到 client/public，避免 dev 下动态 URL 指向 @fs 失败 */
+GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
 export type PdfCitationHighlight = {
   startLine: number;
