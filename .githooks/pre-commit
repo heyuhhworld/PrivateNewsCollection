@@ -1,0 +1,7 @@
+#!/bin/sh
+# 本仓库专用：阻止误提交 .env
+cd "$(dirname "$0")/.." || exit 0
+if command -v node >/dev/null 2>&1; then
+  node scripts/git-pre-commit-block-env.mjs || exit 1
+fi
+exit 0

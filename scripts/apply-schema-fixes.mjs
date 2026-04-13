@@ -242,6 +242,52 @@ async function main() {
       }
     }
 
+    if (await tableExists(conn, "user_reading_profiles")) {
+      if (!(await columnExists(conn, "user_reading_profiles", "briefingInstruction"))) {
+        await conn.query(
+          "ALTER TABLE `user_reading_profiles` ADD COLUMN `briefingInstruction` text NULL"
+        );
+        console.log("已添加 user_reading_profiles.briefingInstruction");
+      } else {
+        console.log("user_reading_profiles.briefingInstruction 已存在");
+      }
+      if (!(await columnExists(conn, "user_reading_profiles", "briefingIntroCompleted"))) {
+        await conn.query(
+          "ALTER TABLE `user_reading_profiles` ADD COLUMN `briefingIntroCompleted` tinyint(1) NOT NULL DEFAULT 0"
+        );
+        console.log("已添加 user_reading_profiles.briefingIntroCompleted");
+      } else {
+        console.log("user_reading_profiles.briefingIntroCompleted 已存在");
+      }
+      if (!(await columnExists(conn, "user_reading_profiles", "briefingSystemPromptCustom"))) {
+        await conn.query(
+          "ALTER TABLE `user_reading_profiles` ADD COLUMN `briefingSystemPromptCustom` text NULL"
+        );
+        console.log("已添加 user_reading_profiles.briefingSystemPromptCustom");
+      } else {
+        console.log("user_reading_profiles.briefingSystemPromptCustom 已存在");
+      }
+    }
+
+    if (await tableExists(conn, "article_reading_images")) {
+      if (!(await columnExists(conn, "article_reading_images", "analysisText"))) {
+        await conn.query(
+          "ALTER TABLE `article_reading_images` ADD COLUMN `analysisText` text NULL"
+        );
+        console.log("已添加 article_reading_images.analysisText");
+      } else {
+        console.log("article_reading_images.analysisText 已存在");
+      }
+      if (!(await columnExists(conn, "article_reading_images", "analysisTags"))) {
+        await conn.query(
+          "ALTER TABLE `article_reading_images` ADD COLUMN `analysisTags` JSON NULL"
+        );
+        console.log("已添加 article_reading_images.analysisTags");
+      } else {
+        console.log("article_reading_images.analysisTags 已存在");
+      }
+    }
+
     if (await tableExists(conn, "news_articles")) {
       const [[row]] = await conn.query(
         `SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS

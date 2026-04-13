@@ -59,11 +59,16 @@ export const appRouter = router({
       .mutation(async ({ input, ctx }) => {
         const email = normalizeEmail(input.email);
         const user = await getUserByEmail(email);
-        if (!user || !user.passwordHash) {
-          throw new Error("邮箱或密码错误");
+        if (!user) {
+          throw new Error("该邮箱尚未注册，请先切换到「注册」创建账号。");
+        }
+        if (!user.passwordHash) {
+          throw new Error(
+            "该邮箱已存在但未设置登录密码（常见于仅 OAuth 同步的账号）。请切换到「重置密码」设置新密码后再登录，或配置 OAuth 后使用 OAuth 登录。"
+          );
         }
         if (!verifyPassword(input.password, user.passwordHash)) {
-          throw new Error("邮箱或密码错误");
+          throw new Error("密码不正确，请重试或切换到「重置密码」。");
         }
         await upsertUser({
           openId: user.openId,

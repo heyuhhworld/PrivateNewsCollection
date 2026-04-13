@@ -1,9 +1,20 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { adminProcedure, publicProcedure, router } from "../_core/trpc";
-import { extractArticleFromHtml } from "../_core/articleExtract";
+import {
+  normalizeNewsRegion,
+  normalizeNewsStrategy,
+  sanitizeNewsTags,
+} from "../_core/articleMetaNormalize";
+import {
+  extractArticleFromHtml,
+  extractPublishedDateFromHtml,
+  parseLlmPublishedAtField,
+  resolveImportPublishedAt,
+} from "../_core/articleExtract";
 import { fetchHtmlForArticleImport } from "../_core/fetchImportUrl";
 import { getImportSessionStatus } from "../_core/importSessionStorage";
+import { inferArticleImportSourceFromUrl } from "../_core/importSourceFromUrl";
 import { invokeLLM } from "../_core/llm";
 import { scheduleArticleEmbedding, buildArticleEmbeddingInput } from "../_core/articleEmbedding";
 import { scheduleEntityExtraction } from "../_core/entityExtraction";
@@ -24,8 +35,10 @@ import {
   isBookmarked,
   adminListNewsArticles,
   adminSetNewsArticleHidden,
+  adminSetNewsArticlesHidden,
   adminDeleteNewsArticle,
-  incrementArticleViewCount,
+  adminDeleteNewsArticles,
+  recordDailyArticleView,
   getNewsArticlesByIds,
   insertTagCorrection,
   updateArticleTags,
@@ -94,11 +107,13 @@ function isLikelyLoginWall(args: {
  * 2. Fetch page HTML（Pitchbook/Preqin 默认 Chromium 无头；其余先 HTTP，403 等再回退浏览器）
  * 3. 用 Readability 从 HTML 抽取真实正文写入 `content`（禁止用 AI 编造正文）
  * 4. 可选：LLM 仅基于正文生成摘要/标签/分类（不得编造事实）
- * 5. Insert into DB
+ * 5. Insert into DB，或管理员传入 `replaceArticleId` 时原地更新该条
  */
 export type ImportArticleOptions = {
   /** 登录后的 Cookie，用于 Preqin 等需登录页面抓取正文 */
   cookieHeader?: string;
+  /** 管理员：按 URL 重新抓取并**原地更新**该 id（跳过「已存在 URL」校验） */
+  replaceArticleId?: number;
 };
 
 export async function importSingleArticle(
@@ -109,19 +124,38 @@ export async function importSingleArticle(
   const db = await getDb();
   if (!db) return { status: "failed", error: getDbUnavailableHint() };
 
-  // ── Step 1: Duplicate check ──────────────────────────────────────────────
-  try {
-    const existing = await db
-      .select({ id: newsArticles.id, title: newsArticles.title })
+  let priorPublishedAtForReplace: Date | undefined;
+  if (options?.replaceArticleId) {
+    const rows = await db
+      .select({ id: newsArticles.id, publishedAt: newsArticles.publishedAt })
       .from(newsArticles)
-      .where(eq(newsArticles.originalUrl, url))
+      .where(eq(newsArticles.id, options.replaceArticleId))
       .limit(1);
-    if (existing.length > 0) {
-      console.log(`[Import] Duplicate skipped: ${url}`);
-      return { status: "duplicate", title: existing[0].title, error: "该文章已存在，跳过" };
+    if (rows.length === 0) {
+      return { status: "failed", error: "要更新的资讯不存在" };
     }
-  } catch (checkErr: any) {
-    console.warn(`[Import] Duplicate check failed: ${checkErr?.message}`);
+    priorPublishedAtForReplace = rows[0].publishedAt ?? undefined;
+  }
+
+  // ── Step 1: Duplicate check（原地更新时跳过，否则同 URL 会误判为重复）────────
+  if (!options?.replaceArticleId) {
+    try {
+      const existing = await db
+        .select({ id: newsArticles.id, title: newsArticles.title })
+        .from(newsArticles)
+        .where(eq(newsArticles.originalUrl, url))
+        .limit(1);
+      if (existing.length > 0) {
+        console.log(`[Import] Duplicate skipped: ${url}`);
+        return {
+          status: "duplicate",
+          title: existing[0].title,
+          error: "该文章已存在，跳过",
+        };
+      }
+    } catch (checkErr: any) {
+      console.warn(`[Import] Duplicate check failed: ${checkErr?.message}`);
+    }
   }
 
   // ── Step 2: Fetch page HTML ───────────────────────────────────────────────
@@ -153,6 +187,8 @@ export async function importSingleArticle(
   if (!articleHtml.trim()) {
     return { status: "failed", error: "页面内容为空，无法导入" };
   }
+
+  const htmlPublishedAt = extractPublishedDateFromHtml(articleHtml, url);
 
   // ── Step 3: 从 HTML 抽取真实正文 ─────────────────────────────────────────
   const extracted = extractArticleFromHtml(articleHtml, url);
@@ -206,7 +242,7 @@ ${bodyForLlm}
 - keyInsights: 3-5 条模块化要点，每条含 label（≤8 字中文小标题）与 value（1-2 句中文，仅来自摘录事实）；语气要直接给结论，不要写“文中指出/报道提到/数据显示”等转述句式
 - sections: 3-5 个结构化模块，每条含 heading（中文小节标题）与 body（2-4 句中文解读/归纳，严禁编造摘录未出现的数据与引语）；语气与 keyInsights 保持一致，直接陈述，不要“文中指出/报告显示/作者认为”
 - author: 若正文/摘录中能识别作者则填写，否则 null
-- publishedAt: ISO 日期 YYYY-MM-DD；正文无日期则用 ${new Date().toISOString().split("T")[0]}
+- publishedAt: 仅当正文摘录中能**明确核对**到文章发布日期时填 ISO 日期 YYYY-MM-DD；若摘录中仅有模糊表述或无法确定具体日，**必须填 null**（禁止用今天或猜测日期占位）
 - strategy: 从 ["私募股权","风险投资","房地产","信贷","基础设施","对冲基金","母基金","并购","成长股权","其他"] 选一或 null
 - region: 从 ["全球","亚太","北美","欧洲","中国","东南亚","中东","其他"] 选一或 null
 - tags: 3-5 个中文标签，需与正文内容相关；不要包含来源站点名或「手工上传」「自动导入」类字样
@@ -252,7 +288,7 @@ ${bodyForLlm}
                 },
               },
               author: { type: ["string", "null"] },
-              publishedAt: { type: "string" },
+              publishedAt: { type: ["string", "null"] },
               strategy: { type: ["string", "null"] },
               region: { type: ["string", "null"] },
               tags: { type: "array", items: { type: "string" } },
@@ -307,10 +343,18 @@ ${bodyForLlm}
           }))
         : [];
 
-    // ── Step 5: Insert into DB ─────────────────────────────────────────────
+    // ── Step 5: Insert / 原地更新 ───────────────────────────────────────────
     const contentZhRaw = String((metadata as { contentZh?: string }).contentZh ?? "").trim();
-    await db.insert(newsArticles).values({
-      source,
+    const llmPublishedAt = parseLlmPublishedAtField(metadata.publishedAt);
+    const publishedAtResolved = resolveImportPublishedAt({
+      htmlDate: htmlPublishedAt,
+      llmDate: llmPublishedAt,
+      replaceFallback: options?.replaceArticleId
+        ? (priorPublishedAtForReplace ?? null)
+        : undefined,
+    });
+
+    const payload = {
       title: titleFinal,
       summary: metadata.summary as string,
       content: extracted.text,
@@ -319,13 +363,35 @@ ${bodyForLlm}
       sections: sections.length > 0 ? sections : [],
       originalUrl: url,
       author: authorFinal,
-      publishedAt: new Date(metadata.publishedAt as string),
-      strategy: metadata.strategy as any,
-      region: metadata.region as any,
-      tags: metadata.tags as string[],
+      publishedAt: publishedAtResolved,
+      strategy: normalizeNewsStrategy(metadata.strategy),
+      region: normalizeNewsRegion(metadata.region),
+      tags: sanitizeNewsTags(metadata.tags),
+      isHidden: false,
+      embedding: null,
+    };
+
+    if (options?.replaceArticleId) {
+      const rid = options.replaceArticleId;
+      await db
+        .update(newsArticles)
+        .set({
+          ...payload,
+          source,
+          createdAt: new Date(),
+        })
+        .where(eq(newsArticles.id, rid));
+      scheduleArticleEmbedding(rid);
+      scheduleEntityExtraction(rid);
+      console.log(`[Import] Re-import updated id=${rid}: ${titleFinal}`);
+      return { status: "success", title: titleFinal };
+    }
+
+    await db.insert(newsArticles).values({
+      source,
+      ...payload,
       isRead: false,
       recordCategory: "news",
-      isHidden: false,
     });
 
     const insertedRow = await db
@@ -416,10 +482,21 @@ export const newsRouter = router({
 
   /** 详情浏览 +1，用于列表热度 */
   recordView: publicProcedure
-    .input(z.object({ id: z.number().int() }))
-    .mutation(async ({ input }) => {
-      await incrementArticleViewCount(input.id);
-      return { success: true };
+    .input(
+      z.object({
+        id: z.number().int(),
+        sessionId: z.string().optional(),
+        entrySource: z.enum(["list", "chat", "other"]).optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const out = await recordDailyArticleView({
+        articleId: input.id,
+        userId: ctx.user?.id ?? null,
+        sessionId: input.sessionId ?? null,
+        entrySource: input.entrySource ?? "other",
+      });
+      return { success: true, counted: out.counted };
     }),
 
   // 书签：添加
@@ -470,12 +547,11 @@ export const newsRouter = router({
   /** 是否已保存 Pitchbook/Preqin 的本机会话（供链导入复用登录态） */
   importSessionStatus: publicProcedure.query(() => getImportSessionStatus()),
 
-  // 手动导入文章 URL（支持批量，最多 10 条）
+  // 手动导入文章 URL（支持批量，最多 10 条）；来源按 URL 域名自动识别
   importByUrl: publicProcedure
     .input(
       z.object({
         urls: z.array(z.string().url()).min(1).max(10),
-        source: z.enum(["Preqin", "Pitchbook"]),
       })
     )
     .mutation(async ({ input }) => {
@@ -487,7 +563,12 @@ export const newsRouter = router({
       }> = [];
 
       for (const url of input.urls) {
-        const result = await importSingleArticle(url, input.source);
+        const inferred = inferArticleImportSourceFromUrl(url);
+        if (!inferred.ok) {
+          results.push({ url, status: "failed", error: inferred.message });
+          continue;
+        }
+        const result = await importSingleArticle(url, inferred.source);
         results.push({ url, ...result });
       }
 
@@ -660,6 +741,83 @@ export const newsRouter = router({
     .mutation(async ({ input }) => {
       await adminDeleteNewsArticle(input.id);
       return { success: true };
+    }),
+
+  adminSetArticlesHidden: adminProcedure
+    .input(
+      z.object({
+        ids: z.array(z.number().int()).min(1).max(50),
+        hidden: z.boolean(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      await adminSetNewsArticlesHidden(input.ids, input.hidden);
+      return { success: true, count: input.ids.length };
+    }),
+
+  adminDeleteArticles: adminProcedure
+    .input(z.object({ ids: z.array(z.number().int()).min(1).max(50) }))
+    .mutation(async ({ input }) => {
+      await adminDeleteNewsArticles(input.ids);
+      return { success: true, count: input.ids.length };
+    }),
+
+  /**
+   * 按库内 originalUrl 重新抓取并原地更新（仅 Preqin/Pitchbook 资讯且需有效链接）。
+   * 逐条执行并短暂间隔，降低对源站压力。
+   */
+  adminBatchReimportArticles: adminProcedure
+    .input(z.object({ ids: z.array(z.number().int()).min(1).max(15) }))
+    .mutation(async ({ input }) => {
+      type RowStatus = "success" | "skipped" | "failed";
+      const results: { id: number; status: RowStatus; message?: string }[] = [];
+      let success = 0;
+      let skipped = 0;
+      let failed = 0;
+
+      for (let i = 0; i < input.ids.length; i++) {
+        const id = input.ids[i]!;
+        const article = await getNewsArticleById(id);
+        if (!article) {
+          failed++;
+          results.push({ id, status: "failed", message: "记录不存在" });
+          continue;
+        }
+        const url = (article.originalUrl ?? "").trim();
+        if (
+          article.recordCategory !== "news" ||
+          (article.source !== "Preqin" && article.source !== "Pitchbook") ||
+          !url
+        ) {
+          skipped++;
+          results.push({
+            id,
+            status: "skipped",
+            message: "仅支持带有效链接的 Preqin / Pitchbook 资讯",
+          });
+          continue;
+        }
+
+        const r = await importSingleArticle(url, article.source as "Preqin" | "Pitchbook", {
+          replaceArticleId: id,
+        });
+        if (r.status === "success") {
+          success++;
+          results.push({ id, status: "success" });
+        } else if (r.status === "duplicate") {
+          skipped++;
+          results.push({ id, status: "skipped", message: r.error ?? "重复" });
+        } else {
+          failed++;
+          results.push({ id, status: "failed", message: r.error ?? "导入失败" });
+        }
+
+        if (i < input.ids.length - 1) {
+          await new Promise((res) => setTimeout(res, 600));
+        }
+      }
+
+      return { success, skipped, failed, results };
     }),
 
   /** 用户修正标签/策略/地区 */

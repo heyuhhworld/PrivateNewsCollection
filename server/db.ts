@@ -1,6 +1,19 @@
 import fs from "fs";
 import path from "path";
-import { and, desc, eq, gte, inArray, isNotNull, like, lte, or, sql } from "drizzle-orm";
+import {
+  and,
+  desc,
+  eq,
+  gt,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  like,
+  lte,
+  or,
+  sql,
+} from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
   InsertUser,
@@ -32,6 +45,11 @@ import {
   type PdfHighlightRectNorm,
 } from "../drizzle/schema";
 import { ENV } from "./_core/env";
+import {
+  canonicalEntityDisplayName,
+  compareEntitiesForMerge,
+  entityMatchKey,
+} from "./_core/entityCanonical";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 let _connectPromise: Promise<void> | null = null;
@@ -261,6 +279,218 @@ export async function incrementArticleViewCount(id: number) {
   }
 }
 
+type ViewEntrySource = "list" | "chat" | "other";
+
+export async function recordDailyArticleView(input: {
+  articleId: number;
+  userId?: number | null;
+  sessionId?: string | null;
+  entrySource?: ViewEntrySource;
+}): Promise<{ counted: boolean }> {
+  const db = await getDb();
+  if (!db) return { counted: false };
+  const userId = input.userId ?? null;
+  const sessionId = input.sessionId ?? null;
+  if (!userId && !sessionId) return { counted: false };
+
+  const now = new Date();
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(now);
+  end.setHours(23, 59, 59, 999);
+
+  const identityWhere = userId
+    ? eq(readingEvents.userId, userId)
+    : and(isNull(readingEvents.userId), eq(readingEvents.sessionId, sessionId!));
+  const where = and(
+    eq(readingEvents.eventType, "article_view_daily"),
+    eq(readingEvents.articleId, input.articleId),
+    identityWhere,
+    gte(readingEvents.createdAt, start),
+    lte(readingEvents.createdAt, end)
+  );
+  const existed = await db
+    .select({ id: readingEvents.id })
+    .from(readingEvents)
+    .where(where)
+    .limit(1);
+  if (existed.length > 0) return { counted: false };
+
+  await db.insert(readingEvents).values({
+    userId: userId ?? undefined,
+    sessionId: sessionId ?? undefined,
+    articleId: input.articleId,
+    eventType: "article_view_daily",
+    payload: {
+      entrySource: input.entrySource ?? "other",
+    },
+  });
+  await db
+    .update(newsArticles)
+    .set({ viewCount: sql`${newsArticles.viewCount} + 1` })
+    .where(eq(newsArticles.id, input.articleId));
+  return { counted: true };
+}
+
+export async function resetAllArticleViewCount(): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(newsArticles).set({ viewCount: 0 });
+}
+
+export async function getHotViewAnalytics(input: {
+  dateFrom: Date;
+  dateTo: Date;
+  limit?: number;
+  minViews?: number;
+}): Promise<{
+  topArticles: Array<{
+    articleId: number;
+    title: string;
+    total: number;
+    /** 时间区间内「访问人次」：article_view_daily 条数（用户×天去重后的访问记录数） */
+    periodPv: number;
+    uniqueViewers: number;
+    /** 区间内详情页停留埋点累计秒数（dwell_tick.payload.dwellSec 之和） */
+    periodDwellSec: number;
+    /** 区间内平均每次访问停留秒数 ≈ periodDwellSec / max(periodPv,1) */
+    avgDwellSec: number;
+    byEntry: { list: number; chat: number; other: number };
+  }>;
+  overallByEntry: { list: number; chat: number; other: number };
+}> {
+  const db = await getDb();
+  if (!db) return { topArticles: [], overallByEntry: { list: 0, chat: 0, other: 0 } };
+  const limit = Math.max(1, Math.min(input.limit ?? 10, 30));
+  const sourceExpr = sql<string>`coalesce(json_unquote(json_extract(${readingEvents.payload}, '$.entrySource')), 'other')`;
+
+  const minV = input.minViews ?? 0;
+  const viewCountWhere = minV > 0
+    ? and(eq(newsArticles.isHidden, false), gte(newsArticles.viewCount, minV))
+    : eq(newsArticles.isHidden, false);
+  const top = await db
+    .select({
+      id: newsArticles.id,
+      title: newsArticles.title,
+      viewCount: newsArticles.viewCount,
+    })
+    .from(newsArticles)
+    .where(and(viewCountWhere, gt(newsArticles.viewCount, 0)))
+    .orderBy(desc(newsArticles.viewCount))
+    .limit(limit);
+
+  const ids = top.map((r) => r.id);
+
+  const eventWhere = and(
+    eq(readingEvents.eventType, "article_view_daily"),
+    gte(readingEvents.createdAt, input.dateFrom),
+    lte(readingEvents.createdAt, input.dateTo),
+    isNotNull(readingEvents.articleId)
+  );
+
+  const identityDistinct = sql<number>`count(distinct concat(
+    cast(coalesce(${readingEvents.userId}, -1) as char),
+    ':',
+    coalesce(${readingEvents.sessionId}, '')
+  ))`.mapWith(Number);
+  const viewerRows =
+    ids.length === 0
+      ? []
+      : await db
+          .select({
+            articleId: readingEvents.articleId,
+            uniqueViewers: identityDistinct,
+          })
+          .from(readingEvents)
+          .where(and(eventWhere, inArray(readingEvents.articleId, ids)))
+          .groupBy(readingEvents.articleId);
+  const viewerMap = new Map<number, number>();
+  for (const r of viewerRows) viewerMap.set(Number(r.articleId), r.uniqueViewers);
+
+  const dwellSecExpr = sql<number>`coalesce(cast(json_unquote(json_extract(${readingEvents.payload}, '$.dwellSec')) as unsigned), 0)`;
+  const dwellWhere =
+    ids.length === 0
+      ? null
+      : and(
+          eq(readingEvents.eventType, "dwell_tick"),
+          gte(readingEvents.createdAt, input.dateFrom),
+          lte(readingEvents.createdAt, input.dateTo),
+          inArray(readingEvents.articleId, ids)
+        );
+  const dwellRows =
+    dwellWhere == null
+      ? []
+      : await db
+          .select({
+            articleId: readingEvents.articleId,
+            totalSec: sql<number>`sum(${dwellSecExpr})`.mapWith(Number),
+          })
+          .from(readingEvents)
+          .where(dwellWhere)
+          .groupBy(readingEvents.articleId);
+  const dwellMap = new Map<number, number>();
+  for (const r of dwellRows) dwellMap.set(Number(r.articleId), Number(r.totalSec ?? 0));
+
+  const byArticleSource =
+    ids.length === 0
+      ? []
+      : await db
+          .select({
+            articleId: readingEvents.articleId,
+            source: sourceExpr,
+            c: sql<number>`count(*)`.mapWith(Number),
+          })
+          .from(readingEvents)
+          .where(and(eventWhere, inArray(readingEvents.articleId, ids)))
+          .groupBy(readingEvents.articleId, sourceExpr);
+
+  const overall = await db
+    .select({
+      source: sourceExpr,
+      c: sql<number>`count(*)`.mapWith(Number),
+    })
+    .from(readingEvents)
+    .where(eventWhere)
+    .groupBy(sourceExpr);
+
+  const byArticleMap = new Map<number, { list: number; chat: number; other: number }>();
+  for (const r of byArticleSource) {
+    const aid = Number(r.articleId);
+    if (!byArticleMap.has(aid)) byArticleMap.set(aid, { list: 0, chat: 0, other: 0 });
+    const box = byArticleMap.get(aid)!;
+    const s = r.source === "list" || r.source === "chat" ? r.source : "other";
+    box[s] += Number(r.c ?? 0);
+  }
+  const overallByEntry = { list: 0, chat: 0, other: 0 };
+  for (const r of overall) {
+    const s = r.source === "list" || r.source === "chat" ? r.source : "other";
+    overallByEntry[s] += Number(r.c ?? 0);
+  }
+
+  const topArticles = top.map((r) => {
+    const be = byArticleMap.get(r.id) ?? { list: 0, chat: 0, other: 0 };
+    const periodPv = be.list + be.chat + be.other;
+    const periodDwellSec = dwellMap.get(r.id) ?? 0;
+    const avgDwellSec =
+      periodPv > 0
+        ? Math.round(periodDwellSec / periodPv)
+        : periodDwellSec > 0
+          ? Math.round(periodDwellSec / Math.max(1, viewerMap.get(r.id) ?? 1))
+          : 0;
+    return {
+      articleId: r.id,
+      title: r.title,
+      total: r.viewCount,
+      periodPv,
+      uniqueViewers: viewerMap.get(r.id) ?? 0,
+      periodDwellSec,
+      avgDwellSec,
+      byEntry: be,
+    };
+  });
+  return { topArticles, overallByEntry };
+}
+
 export async function updateNewsArticleEmbedding(id: number, embedding: number[]) {
   const db = await getDb();
   if (!db) return;
@@ -316,17 +546,53 @@ export async function getLatestAiBriefing() {
   return row[0] ?? null;
 }
 
-export async function listRecentNewsArticlesSince(since: Date, limit: number) {
+export async function listRecentNewsArticlesSince(
+  since: Date,
+  limit: number,
+  strategy?: string | null
+) {
   const db = await getDb();
   if (!db) return [];
+  const conditions = [
+    eq(newsArticles.isHidden, false),
+    gte(newsArticles.createdAt, since),
+  ];
+  if (strategy) {
+    conditions.push(eq(newsArticles.strategy, strategy));
+  }
   return db
     .select()
     .from(newsArticles)
-    .where(
-      and(eq(newsArticles.isHidden, false), gte(newsArticles.createdAt, since))
-    )
+    .where(and(...conditions))
     .orderBy(desc(newsArticles.publishedAt))
     .limit(limit);
+}
+
+export async function getUserPreferredStrategy(
+  userId: number
+): Promise<string | null> {
+  const db = await getDb();
+  if (!db) return null;
+  const since = new Date();
+  since.setDate(since.getDate() - 30);
+  const rows = await db
+    .select({
+      strategy: newsArticles.strategy,
+      c: sql<number>`count(*)`.mapWith(Number),
+    })
+    .from(readingEvents)
+    .innerJoin(newsArticles, eq(readingEvents.articleId, newsArticles.id))
+    .where(
+      and(
+        eq(readingEvents.userId, userId),
+        gte(readingEvents.createdAt, since),
+        isNotNull(newsArticles.strategy)
+      )
+    )
+    .groupBy(newsArticles.strategy)
+    .orderBy(sql`count(*) DESC`)
+    .limit(1);
+  return rows[0]?.strategy ?? null;
 }
 
 export type AdminNewsArticleListItem = NewsArticle & {
@@ -398,6 +664,15 @@ export async function adminSetNewsArticleHidden(id: number, isHidden: boolean) {
   await db.update(newsArticles).set({ isHidden }).where(eq(newsArticles.id, id));
 }
 
+/** 批量更新展示状态（管理员资讯库） */
+export async function adminSetNewsArticlesHidden(ids: number[], isHidden: boolean) {
+  const db = await getDb();
+  if (!db || ids.length === 0) return;
+  const unique = Array.from(new Set(ids.filter((n) => Number.isFinite(n) && n > 0)));
+  if (unique.length === 0) return;
+  await db.update(newsArticles).set({ isHidden }).where(inArray(newsArticles.id, unique));
+}
+
 export async function adminDeleteNewsArticle(id: number) {
   const db = await getDb();
   if (!db) return;
@@ -417,6 +692,14 @@ export async function adminDeleteNewsArticle(id: number) {
   await db.delete(readingEvents).where(eq(readingEvents.articleId, id));
   await db.delete(bookmarks).where(eq(bookmarks.articleId, id));
   await db.delete(newsArticles).where(eq(newsArticles.id, id));
+}
+
+/** 批量删除：逐条复用单条删除逻辑（含阅读图片等附属清理） */
+export async function adminDeleteNewsArticles(ids: number[]) {
+  const unique = Array.from(new Set(ids.filter((n) => Number.isFinite(n) && n > 0)));
+  for (const id of unique) {
+    await adminDeleteNewsArticle(id);
+  }
 }
 
 export async function markArticleAsRead(id: number) {
@@ -553,32 +836,260 @@ export async function saveChatMessage(msg: InsertChatMessage) {
   await db.insert(chatMessages).values(msg);
 }
 
+export async function listChatSessionsByUser(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db
+    .select({
+      sessionId: chatMessages.sessionId,
+      lastAt: sql<Date>`max(${chatMessages.createdAt})`,
+      totalMessages: sql<number>`count(*)`.mapWith(Number),
+    })
+    .from(chatMessages)
+    .where(eq(chatMessages.userId, userId))
+    .groupBy(chatMessages.sessionId)
+    .orderBy(desc(sql`max(${chatMessages.createdAt})`))
+    .limit(200);
+
+  const out: Array<{
+    sessionId: string;
+    title: string;
+    lastAt: Date;
+    totalMessages: number;
+  }> = [];
+
+  for (const r of rows) {
+    const sessionRows = await db
+      .select({
+        role: chatMessages.role,
+        content: chatMessages.content,
+      })
+      .from(chatMessages)
+      .where(and(eq(chatMessages.userId, userId), eq(chatMessages.sessionId, r.sessionId)))
+      .orderBy(chatMessages.createdAt)
+      .limit(20);
+    const firstUser = sessionRows.find((m) => m.role === "user")?.content?.trim() ?? "";
+    const renamed = firstUser.match(/^\[会话名:(.+?)\]\s*/);
+    const titleRaw = renamed
+      ? renamed[1]
+      : firstUser || "新对话";
+    out.push({
+      sessionId: r.sessionId,
+      title: titleRaw.slice(0, 60),
+      lastAt: r.lastAt,
+      totalMessages: r.totalMessages,
+    });
+  }
+  return out;
+}
+
+export async function renameChatSessionByUser(
+  userId: number,
+  sessionId: string,
+  title: string
+): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const firstUserMsg = await db
+    .select({
+      id: chatMessages.id,
+      content: chatMessages.content,
+    })
+    .from(chatMessages)
+    .where(
+      and(
+        eq(chatMessages.userId, userId),
+        eq(chatMessages.sessionId, sessionId),
+        eq(chatMessages.role, "user")
+      )
+    )
+    .orderBy(chatMessages.createdAt)
+    .limit(1);
+  if (firstUserMsg.length === 0) return false;
+  const row = firstUserMsg[0];
+  const cleaned = row.content.replace(/^\[会话名:.+?\]\s*/, "").trimStart();
+  const nextContent = `[会话名:${title.trim().slice(0, 60)}] ${cleaned}`;
+  await db
+    .update(chatMessages)
+    .set({ content: nextContent })
+    .where(eq(chatMessages.id, row.id));
+  return true;
+}
+
+export async function deleteChatSessionByUser(
+  userId: number,
+  sessionId: string
+): Promise<number> {
+  const db = await getDb();
+  if (!db) return 0;
+  const exists = await db
+    .select({ id: chatMessages.id })
+    .from(chatMessages)
+    .where(and(eq(chatMessages.userId, userId), eq(chatMessages.sessionId, sessionId)))
+    .limit(1);
+  if (exists.length === 0) return 0;
+  await db
+    .delete(chatMessages)
+    .where(and(eq(chatMessages.userId, userId), eq(chatMessages.sessionId, sessionId)));
+  return 1;
+}
+
 // ─── Entities (Knowledge Graph) ─────────────────────────────────────────────
 
-export async function upsertEntity(data: {
-  name: string;
-  type: "fund" | "institution" | "person" | "other";
-  aliases?: string[] | null;
-}): Promise<number | null> {
+export type EntityMatchIndex = Map<string, { id: number; name: string }>;
+
+/** 全表构建「规范化键 → 实体」索引；同键保留 id 较小的一条（与定期合并策略一致） */
+export async function buildEntityMatchIndex(): Promise<EntityMatchIndex> {
+  const db = await getDb();
+  const m: EntityMatchIndex = new Map();
+  if (!db) return m;
+  const rows = await db.select({ id: entities.id, name: entities.name }).from(entities);
+  for (const r of rows) {
+    const key = entityMatchKey(r.name);
+    const cur = m.get(key);
+    if (!cur || r.id < cur.id) m.set(key, { id: r.id, name: r.name });
+  }
+  return m;
+}
+
+/**
+ * 写入实体：按规范化键与已知品牌展示名归并，避免 PitchBook / Pitchbook 等多行。
+ * @param matchIndex 可选；批量抽取时传入同一 Map 可减少查询并在单次导入内去重。
+ */
+export async function upsertEntity(
+  data: {
+    name: string;
+    type: "fund" | "institution" | "person" | "other";
+    aliases?: string[] | null;
+  },
+  matchIndex?: EntityMatchIndex
+): Promise<number | null> {
   const db = await getDb();
   if (!db) return null;
-  const existing = await db
-    .select()
-    .from(entities)
-    .where(eq(entities.name, data.name))
-    .limit(1);
-  if (existing.length > 0) return existing[0].id;
+  const displayName = canonicalEntityDisplayName(data.name.trim());
+  const key = entityMatchKey(displayName);
+  const index = matchIndex ?? (await buildEntityMatchIndex());
+  const hit = index.get(key);
+  if (hit) return hit.id;
+
   await db.insert(entities).values({
-    name: data.name,
+    name: displayName,
     type: data.type,
     aliases: data.aliases ?? null,
   });
   const row = await db
     .select({ id: entities.id })
     .from(entities)
-    .where(eq(entities.name, data.name))
+    .where(eq(entities.name, displayName))
+    .orderBy(desc(entities.id))
     .limit(1);
-  return row[0]?.id ?? null;
+  const newId = row[0]?.id ?? null;
+  if (newId != null) index.set(key, { id: newId, name: displayName });
+  return newId;
+}
+
+/** 将 fromId 合并进 toId：迁移文章关联与关系边后删除 fromId */
+export async function mergeEntityIntoCanonical(fromId: number, toId: number): Promise<void> {
+  if (fromId === toId) return;
+  const db = await getDb();
+  if (!db) return;
+
+  await db.transaction(async (tx) => {
+    const fromLinks = await tx
+      .select()
+      .from(entityArticles)
+      .where(eq(entityArticles.entityId, fromId));
+    for (const l of fromLinks) {
+      const dup = await tx
+        .select({ id: entityArticles.id })
+        .from(entityArticles)
+        .where(
+          and(eq(entityArticles.entityId, toId), eq(entityArticles.articleId, l.articleId))
+        )
+        .limit(1);
+      if (dup.length > 0) {
+        await tx.delete(entityArticles).where(eq(entityArticles.id, l.id));
+      } else {
+        await tx
+          .update(entityArticles)
+          .set({ entityId: toId })
+          .where(eq(entityArticles.id, l.id));
+      }
+    }
+
+    await tx
+      .update(entityRelations)
+      .set({ sourceEntityId: toId })
+      .where(eq(entityRelations.sourceEntityId, fromId));
+    await tx
+      .update(entityRelations)
+      .set({ targetEntityId: toId })
+      .where(eq(entityRelations.targetEntityId, fromId));
+
+    await tx.delete(entities).where(eq(entities.id, fromId));
+  });
+}
+
+/** 删除自环关系与 (source,target,relationType,articleId) 完全重复的行 */
+export async function dedupeEntityRelations(): Promise<{ removed: number }> {
+  const db = await getDb();
+  if (!db) return { removed: 0 };
+  const all = await db.select().from(entityRelations);
+  const seen = new Set<string>();
+  const toRemove: number[] = [];
+  for (const r of all) {
+    if (r.sourceEntityId === r.targetEntityId) {
+      toRemove.push(r.id);
+      continue;
+    }
+    const k = `${r.sourceEntityId}:${r.targetEntityId}:${r.relationType}:${r.articleId}`;
+    if (seen.has(k)) toRemove.push(r.id);
+    else seen.add(k);
+  }
+  if (toRemove.length === 0) return { removed: 0 };
+  const uniqueIds = Array.from(new Set(toRemove));
+  for (let i = 0; i < uniqueIds.length; i += 200) {
+    const chunk = uniqueIds.slice(i, i + 200);
+    await db.delete(entityRelations).where(inArray(entityRelations.id, chunk));
+  }
+  return { removed: uniqueIds.length };
+}
+
+/**
+ * 按规范化键合并历史重复实体，并清理关系表。
+ * 建议在低峰定时跑，也可由管理员手动触发。
+ */
+export async function mergeDuplicateEntitiesByMatchKey(): Promise<{
+  groupsMerged: number;
+  entitiesRemoved: number;
+}> {
+  const db = await getDb();
+  if (!db) return { groupsMerged: 0, entitiesRemoved: 0 };
+  const rows = await db.select().from(entities);
+  const groups = new Map<string, typeof rows>();
+  for (const r of rows) {
+    const k = entityMatchKey(r.name);
+    const arr = groups.get(k) ?? [];
+    arr.push(r);
+    groups.set(k, arr);
+  }
+  let groupsMerged = 0;
+  let entitiesRemoved = 0;
+  const groupLists = Array.from(groups.values());
+  for (let gi = 0; gi < groupLists.length; gi++) {
+    const arr = groupLists[gi]!;
+    if (arr.length < 2) continue;
+    groupsMerged++;
+    arr.sort(compareEntitiesForMerge);
+    const keep = arr[0]!;
+    for (let i = 1; i < arr.length; i++) {
+      const loser = arr[i]!;
+      await mergeEntityIntoCanonical(loser.id, keep.id);
+      entitiesRemoved++;
+    }
+  }
+  await dedupeEntityRelations();
+  return { groupsMerged, entitiesRemoved };
 }
 
 export async function linkEntityToArticle(
@@ -838,6 +1349,75 @@ export async function insertReadingImage(data: {
   return row[0]?.id ?? null;
 }
 
+export async function updateReadingImageCaption(
+  id: number,
+  caption: string | null,
+  userId: number | null,
+  isAdmin: boolean,
+  sessionId?: string | null
+): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db
+    .select({
+      id: articleReadingImages.id,
+      createdByUserId: articleReadingImages.createdByUserId,
+      sessionId: articleReadingImages.sessionId,
+    })
+    .from(articleReadingImages)
+    .where(eq(articleReadingImages.id, id))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return false;
+  if (!isAdmin) {
+    if (row.createdByUserId != null) {
+      if (userId == null || row.createdByUserId !== userId) return false;
+    } else {
+      const sid = (sessionId ?? "").trim();
+      const rsid = (row.sessionId ?? "").trim();
+      if (!sid || !rsid || sid !== rsid) return false;
+    }
+  }
+  await db
+    .update(articleReadingImages)
+    .set({ caption: caption ?? null })
+    .where(eq(articleReadingImages.id, id));
+  return true;
+}
+
+export async function deleteReadingImage(
+  id: number,
+  userId: number | null,
+  isAdmin: boolean,
+  sessionId?: string | null
+): Promise<{ ok: boolean; storageKey?: string }> {
+  const db = await getDb();
+  if (!db) return { ok: false };
+  const rows = await db
+    .select({
+      id: articleReadingImages.id,
+      storageKey: articleReadingImages.storageKey,
+      createdByUserId: articleReadingImages.createdByUserId,
+      sessionId: articleReadingImages.sessionId,
+    })
+    .from(articleReadingImages)
+    .where(eq(articleReadingImages.id, id))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return { ok: false };
+  if (!isAdmin) {
+    if (row.createdByUserId != null) {
+      if (userId == null || row.createdByUserId !== userId) return { ok: false };
+    } else {
+      const sid = (sessionId ?? "").trim();
+      const rsid = (row.sessionId ?? "").trim();
+      if (!sid || !rsid || sid !== rsid) return { ok: false };
+    }
+  }
+  await db.delete(articleReadingImages).where(eq(articleReadingImages.id, id));
+  return { ok: true, storageKey: row.storageKey };
+}
+
 export async function insertReadingEvent(data: {
   userId: number | null;
   sessionId: string | null;
@@ -865,12 +1445,61 @@ export async function insertReadingEvent(data: {
 export async function getUserReadingProfile(userId: number) {
   const db = await getDb();
   if (!db) return null;
-  const rows = await db
-    .select()
-    .from(userReadingProfiles)
-    .where(eq(userReadingProfiles.userId, userId))
-    .limit(1);
-  return rows[0] ?? null;
+  try {
+    const rows = await db
+      .select()
+      .from(userReadingProfiles)
+      .where(eq(userReadingProfiles.userId, userId))
+      .limit(1);
+    return rows[0] ?? null;
+  } catch (e) {
+    // 兼容旧库缺列（如 briefingSystemPromptCustom）导致的查询失败，降级为空画像
+    console.warn("[getUserReadingProfile:fallback-null]", e);
+    return null;
+  }
+}
+
+/** 简报偏好：无行则插入占位 summary，避免与 rollup 写入冲突 */
+export async function upsertUserBriefingPrefs(
+  userId: number,
+  patch: {
+    briefingInstruction?: string | null;
+    briefingSystemPromptCustom?: string | null;
+    briefingIntroCompleted?: boolean;
+  }
+): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  const existing = await getUserReadingProfile(userId);
+  if (existing) {
+    await db
+      .update(userReadingProfiles)
+      .set({
+        ...(patch.briefingInstruction !== undefined && {
+          briefingInstruction: patch.briefingInstruction,
+        }),
+        ...(patch.briefingSystemPromptCustom !== undefined && {
+          briefingSystemPromptCustom: patch.briefingSystemPromptCustom,
+        }),
+        ...(patch.briefingIntroCompleted !== undefined && {
+          briefingIntroCompleted: patch.briefingIntroCompleted,
+        }),
+        updatedAt: new Date(),
+      })
+      .where(eq(userReadingProfiles.userId, userId));
+    return;
+  }
+  await db.insert(userReadingProfiles).values({
+    userId,
+    summaryJson: {
+      counts: {},
+      summaryText: "使用系统后此处将汇总阅读习惯；简报偏好已单独保存。",
+      rolledUpAt: new Date().toISOString(),
+    },
+    briefingInstruction: patch.briefingInstruction ?? null,
+    briefingSystemPromptCustom: patch.briefingSystemPromptCustom ?? null,
+    briefingIntroCompleted: patch.briefingIntroCompleted ?? false,
+  });
 }
 
 export async function upsertUserReadingProfile(
@@ -915,4 +1544,82 @@ export async function rollupUserReadingProfile(userId: number): Promise<void> {
     summaryText,
     rolledUpAt: new Date().toISOString(),
   });
+}
+
+export async function getArticlesByUploader(input: {
+  uploaderUserId: number;
+  dateFrom: Date;
+  dateTo: Date;
+  limit?: number;
+}): Promise<
+  Pick<NewsArticle, "id" | "title" | "summary" | "source" | "recordCategory" | "strategy" | "region" | "createdAt">[]
+> {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db
+    .select({
+      id: newsArticles.id,
+      title: newsArticles.title,
+      summary: newsArticles.summary,
+      source: newsArticles.source,
+      recordCategory: newsArticles.recordCategory,
+      strategy: newsArticles.strategy,
+      region: newsArticles.region,
+      createdAt: newsArticles.createdAt,
+    })
+    .from(newsArticles)
+    .where(
+      and(
+        eq(newsArticles.uploaderUserId, input.uploaderUserId),
+        gte(newsArticles.createdAt, input.dateFrom),
+        lte(newsArticles.createdAt, input.dateTo),
+        eq(newsArticles.isHidden, false),
+      )
+    )
+    .orderBy(desc(newsArticles.createdAt))
+    .limit(input.limit ?? 50);
+  return rows;
+}
+
+/** 按关键词搜索已分析的图片 */
+export async function searchReadingImages(query: string, opts?: {
+  articleId?: number;
+  userId?: number;
+  limit?: number;
+}): Promise<{
+  id: number;
+  articleId: number;
+  storageKey: string;
+  caption: string | null;
+  analysisText: string | null;
+  analysisTags: string[] | null;
+  sourcePage: number | null;
+  createdAt: Date;
+}[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const conds = [isNotNull(articleReadingImages.analysisText)];
+  if (opts?.articleId) conds.push(eq(articleReadingImages.articleId, opts.articleId));
+  if (opts?.userId) conds.push(eq(articleReadingImages.createdByUserId, opts.userId));
+  if (query) {
+    conds.push(
+      sql`(${articleReadingImages.analysisText} LIKE ${"%" + query + "%"} OR ${articleReadingImages.caption} LIKE ${"%" + query + "%"} OR JSON_SEARCH(${articleReadingImages.analysisTags}, 'one', ${"%" + query + "%"}) IS NOT NULL)`,
+    );
+  }
+  const rows = await db
+    .select({
+      id: articleReadingImages.id,
+      articleId: articleReadingImages.articleId,
+      storageKey: articleReadingImages.storageKey,
+      caption: articleReadingImages.caption,
+      analysisText: articleReadingImages.analysisText,
+      analysisTags: articleReadingImages.analysisTags,
+      sourcePage: articleReadingImages.sourcePage,
+      createdAt: articleReadingImages.createdAt,
+    })
+    .from(articleReadingImages)
+    .where(and(...conds))
+    .orderBy(desc(articleReadingImages.createdAt))
+    .limit(opts?.limit ?? 10);
+  return rows;
 }

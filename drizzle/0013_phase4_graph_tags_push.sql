@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS `entities` (
   `aliases` JSON NULL,
   `createdAt` timestamp NOT NULL DEFAULT (now()),
   CONSTRAINT `entities_id` PRIMARY KEY(`id`)
-);
+);--> statement-breakpoint
 
 CREATE TABLE IF NOT EXISTS `entity_articles` (
   `id` int AUTO_INCREMENT NOT NULL,
@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS `entity_articles` (
   CONSTRAINT `entity_articles_id` PRIMARY KEY(`id`),
   INDEX `idx_ea_entity` (`entityId`),
   INDEX `idx_ea_article` (`articleId`)
-);
+);--> statement-breakpoint
 
 CREATE TABLE IF NOT EXISTS `entity_relations` (
   `id` int AUTO_INCREMENT NOT NULL,
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS `entity_relations` (
   CONSTRAINT `entity_relations_id` PRIMARY KEY(`id`),
   INDEX `idx_er_source` (`sourceEntityId`),
   INDEX `idx_er_target` (`targetEntityId`)
-);
+);--> statement-breakpoint
 
 CREATE TABLE IF NOT EXISTS `tag_corrections` (
   `id` int AUTO_INCREMENT NOT NULL,
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS `tag_corrections` (
   `createdAt` timestamp NOT NULL DEFAULT (now()),
   CONSTRAINT `tag_corrections_id` PRIMARY KEY(`id`),
   INDEX `idx_tc_article` (`articleId`)
-);
+);--> statement-breakpoint
 
 CREATE TABLE IF NOT EXISTS `briefing_subscriptions` (
   `id` int AUTO_INCREMENT NOT NULL,

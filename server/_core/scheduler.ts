@@ -1,10 +1,11 @@
 import cron from "node-cron";
+import { generateBriefingMarkdownFromArticles } from "./briefingGenerate";
 import { ENV } from "./env";
-import { invokeLLM } from "./llm";
 import {
   insertAiBriefing,
   listRecentNewsArticlesSince,
   listBriefingSubscriptions,
+  mergeDuplicateEntitiesByMatchKey,
 } from "../db";
 import { sendMail, isMailerConfigured } from "./mailer";
 
@@ -15,39 +16,14 @@ async function generateBriefingBody(): Promise<{
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const articles = await listRecentNewsArticlesSince(since, 100);
   if (articles.length === 0) {
-    const body =
-      "## 过去 24 小时资讯简报\n\n当前时段内没有新入库文章。";
+    const body = "## 过去 24 小时资讯简报\n\n当前时段内没有新入库文章。";
     return { body, articleCount: 0 };
   }
 
-  const lines = articles.map(
-    (a) =>
-      `- id=${a.id} | ${a.source} | ${a.title} | 摘要: ${(a.summary ?? "—").slice(0, 160)}`
-  );
-
-  const resp = await invokeLLM({
-    messages: [
-      {
-        role: "system",
-        content: `你是 IPMS 投资资讯编辑。根据给定文章列表写一份**中文 Markdown 晨报**：
-- 一级标题用 ## 
-- 2～3 段市场概览
-- 用 ### 小标题按主题或策略分组要点
-- 每条要点可标注来源 id（便于核对）
-- 勿编造列表中不存在的事实`,
-      },
-      {
-        role: "user",
-        content: `共 ${articles.length} 篇新入库（过去约 24 小时），请写晨报：\n\n${lines.join("\n")}`,
-      },
-    ],
+  const extra = ENV.briefingExtraInstruction?.trim() || null;
+  const body = await generateBriefingMarkdownFromArticles(articles, {
+    extraInstruction: extra,
   });
-
-  const raw = resp.choices?.[0]?.message?.content;
-  const body =
-    typeof raw === "string" && raw.trim()
-      ? raw.trim()
-      : "## 简报\n\n生成失败，请稍后重试。";
   return { body, articleCount: articles.length };
 }
 
@@ -127,4 +103,22 @@ export function startScheduler(): void {
   console.log(
     `[Scheduler] Briefing cron "${expr}" registered (${mailHint})`
   );
+
+  const kgExpr = ENV.kgMergeCron;
+  if (kgExpr && cron.validate(kgExpr)) {
+    cron.schedule(kgExpr, async () => {
+      console.log("[Scheduler] KG merge cron — deduplicating entities…");
+      try {
+        const { groupsMerged, entitiesRemoved } = await mergeDuplicateEntitiesByMatchKey();
+        console.log(
+          `[Scheduler] KG merge done: ${groupsMerged} duplicate groups, ${entitiesRemoved} rows merged away`
+        );
+      } catch (e) {
+        console.error("[Scheduler] KG merge failed:", e);
+      }
+    });
+    console.log(`[Scheduler] Knowledge graph merge cron "${kgExpr}" registered`);
+  } else if (kgExpr) {
+    console.warn(`[Scheduler] Invalid KG_MERGE_CRON "${kgExpr}", skip`);
+  }
 }

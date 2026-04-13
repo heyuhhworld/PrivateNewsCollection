@@ -13,6 +13,7 @@ import {
   insertReadingEvent,
   insertReadingImage,
 } from "../db";
+import { scheduleImageAnalysis } from "./imageAnalysis";
 
 const DIR = path.join(process.cwd(), "uploads", "news", "reading-images");
 const MAX_BYTES = 8 * 1024 * 1024;
@@ -112,6 +113,7 @@ export function registerReadingImageUploadRoutes(app: Express) {
           eventType: "reading_image_save",
           payload: { storageKey },
         });
+        if (id) scheduleImageAnalysis(id);
         res.json({ success: true, id, url: `/uploads/news/${storageKey}` });
       } catch (e: unknown) {
         fs.unlink(file.path, () => {});

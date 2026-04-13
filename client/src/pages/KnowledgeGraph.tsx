@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { trpc } from "@/lib/trpc";
-import { Loader2, Network, ZoomIn, ZoomOut, RotateCcw, Search } from "lucide-react";
+import {
+  Loader2,
+  Network,
+  ZoomIn,
+  ZoomOut,
+  RotateCcw,
+  Search,
+  Combine,
+} from "lucide-react";
+import { useAuth } from "@/_core/hooks/useAuth";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useLocation } from "wouter";
@@ -143,7 +153,18 @@ function useForceLayout(
 }
 
 export default function KnowledgeGraph() {
+  const { user } = useAuth();
+  const utils = trpc.useUtils();
   const { data, isLoading } = trpc.kg.graph.useQuery();
+  const mergeDuplicatesMutation = trpc.kg.mergeDuplicateEntities.useMutation({
+    onSuccess: (r) => {
+      toast.success(
+        `已合并 ${r.entitiesRemoved} 条重复实体（${r.groupsMerged} 组），关系已去重`
+      );
+      void utils.kg.graph.invalidate();
+    },
+    onError: (e) => toast.error(e.message),
+  });
   const [, setLocation] = useLocation();
   const containerRef = useRef<HTMLDivElement>(null);
   const [dim, setDim] = useState({ w: 900, h: 600 });
@@ -235,6 +256,24 @@ export default function KnowledgeGraph() {
           <span className="text-xs text-gray-400">
             {rawNodes.length} 实体 · {rawEdges.length} 关系
           </span>
+          {user?.role === "admin" && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs gap-1 ml-1"
+              disabled={mergeDuplicatesMutation.isPending}
+              title="将 PitchBook / Pitchbook 等同名实体合并并整理关系边"
+              onClick={() => mergeDuplicatesMutation.mutate()}
+            >
+              {mergeDuplicatesMutation.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Combine className="h-3.5 w-3.5" />
+              )}
+              合并重复实体
+            </Button>
+          )}
         </div>
         <div className="relative flex-1 max-w-xs ml-auto">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />

@@ -262,6 +262,10 @@ export const articleReadingImages = mysqlTable("article_reading_images", {
   caption: text("caption"),
   sourcePage: int("sourcePage"),
   sourceRect: json("sourceRect").$type<PdfHighlightRectNorm | null>(),
+  /** LLM vision 提取的图片内容描述 */
+  analysisText: text("analysisText"),
+  /** LLM 生成的智能标签 JSON 数组 */
+  analysisTags: json("analysisTags").$type<string[] | null>(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 
@@ -289,6 +293,11 @@ export const userReadingProfiles = mysqlTable("user_reading_profiles", {
   summaryJson: json("summaryJson").$type<Record<string, unknown>>().notNull(),
   /** 用户对「每日简报」正文的额外写作要求（合并进 system prompt） */
   briefingInstruction: text("briefingInstruction"),
+  /**
+   * 非空时：生成「重新生成简报」时**整条**作为 system 内容（覆盖默认模板）；
+   * 为空时走 briefingInstruction + 系统默认模板。
+   */
+  briefingSystemPromptCustom: text("briefingSystemPromptCustom"),
   /** 已在简报页看过默认 prompt 说明（含「暂不调整」），不再自动弹层 */
   briefingIntroCompleted: boolean("briefingIntroCompleted").default(false).notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),

@@ -9,6 +9,8 @@ import { registerOAuthRoutes } from "./oauth";
 import { registerNewsUploadRoutes } from "./newsUpload";
 import { registerReadingImageUploadRoutes } from "./readingImageUpload";
 import { registerChatStreamRoute } from "./chatStreamRoute";
+import { registerChromeExtensionDownload } from "./chromeExtensionDownload";
+import { registerLanHintRoute } from "./lanHintRoute";
 import { startScheduler } from "./scheduler";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
@@ -27,6 +29,9 @@ async function startServer() {
     res.setHeader("cache-control", "no-store");
     res.status(200).json({ ok: true });
   });
+
+  registerChromeExtensionDownload(app);
+  registerLanHintRoute(app);
 
   // OAuth callback under /api/oauth/callback
   registerOAuthRoutes(app);

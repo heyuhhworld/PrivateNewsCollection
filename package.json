@@ -4,7 +4,11 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
+    "prepare": "node scripts/setup-git-hooks.mjs",
     "dev": "NODE_ENV=development tsx watch server/_core/index.ts",
+    "dev:restart": "node scripts/dev-restart.mjs",
+    "dev:verify": "node scripts/dev-verify.mjs",
+    "dev:check": "node scripts/dev-health-check.mjs",
     "build": "vite build && esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
     "start": "NODE_ENV=production node dist/index.js",
     "check": "tsc --noEmit",

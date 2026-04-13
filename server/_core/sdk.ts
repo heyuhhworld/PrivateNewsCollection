@@ -157,8 +157,14 @@ class SDKServer {
   }
 
   private getSessionSecret() {
-    const secret = ENV.cookieSecret;
-    return new TextEncoder().encode(secret);
+    const trimmed = ENV.cookieSecret?.trim();
+    if (trimmed) return new TextEncoder().encode(trimmed);
+    if (!ENV.isProduction) {
+      return new TextEncoder().encode("__dev_ipms_jwt_secret__");
+    }
+    throw new Error(
+      "JWT_SECRET 未配置：请在 .env 中设置 JWT_SECRET（生产环境必填）"
+    );
   }
 
   /**
@@ -272,21 +278,36 @@ class SDKServer {
     const signedInAt = new Date();
     let user = await db.getUserByOpenId(sessionUserId);
 
-    // If user not in DB, sync from OAuth server automatically
+    // If user not in DB, sync from OAuth server — or locally when OAuth 未配置（邮箱登录等）
     if (!user) {
-      try {
-        const userInfo = await this.getUserInfoWithJwt(sessionCookie ?? "");
+      const oauthConfigured = Boolean(ENV.oAuthServerUrl?.trim());
+      if (!oauthConfigured) {
+        const emailFromOpenId = sessionUserId.startsWith("email:")
+          ? sessionUserId.slice("email:".length)
+          : null;
         await db.upsertUser({
-          openId: userInfo.openId,
-          name: userInfo.name || null,
-          email: userInfo.email ?? null,
-          loginMethod: userInfo.loginMethod ?? userInfo.platform ?? null,
+          openId: sessionUserId,
+          name: session.name?.trim() || null,
+          email: emailFromOpenId ?? undefined,
+          loginMethod: emailFromOpenId ? "email" : "local-session",
           lastSignedIn: signedInAt,
         });
-        user = await db.getUserByOpenId(userInfo.openId);
-      } catch (error) {
-        console.error("[Auth] Failed to sync user from OAuth:", error);
-        throw ForbiddenError("Failed to sync user info");
+        user = await db.getUserByOpenId(sessionUserId);
+      } else {
+        try {
+          const userInfo = await this.getUserInfoWithJwt(sessionCookie ?? "");
+          await db.upsertUser({
+            openId: userInfo.openId,
+            name: userInfo.name || null,
+            email: userInfo.email ?? null,
+            loginMethod: userInfo.loginMethod ?? userInfo.platform ?? null,
+            lastSignedIn: signedInAt,
+          });
+          user = await db.getUserByOpenId(userInfo.openId);
+        } catch (error) {
+          console.error("[Auth] Failed to sync user from OAuth:", error);
+          throw ForbiddenError("Failed to sync user info");
+        }
       }
     }
 

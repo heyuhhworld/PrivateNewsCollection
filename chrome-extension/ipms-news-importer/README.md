@@ -1,17 +1,26 @@
 # IPMS 资讯导入（Chrome 扩展）
 
-独立子目录，不在根 `package.json` 工作区内打包；直接在 Chrome **扩展程序 → 开发者模式 → 加载已解压的扩展程序**，选择本文件夹即可。
+独立子目录，不在根 `package.json` 工作区内打包。
+
+## 获取方式（终端用户）
+
+1. 在 IPMS 里打开 **AI 资讯助手**，点击 **「插件 ZIP」**：会先弹出**分步安装说明**，再点其中的 **「下载 ZIP 文件」** 即可。
+2. 也可在浏览器直接访问：`{你的站点根地址}/api/chrome-extension/bundle.zip` 下载后按弹窗/助手内说明解压并加载。
+3. **从源码目录加载**（开发者）：在 Chrome **加载已解压的扩展程序**，直接选择本仓库文件夹 `chrome-extension/ipms-news-importer`。
 
 ## 功能
 
 1. **导入当前标签页**：抓取 `document.title`、URL、`body.innerText`，调用站点 `POST /api/news/import-page`，入库为 `source = ChromeExtension`、`recordCategory = news`，并由 LLM 生成与手工上传同一风格的标题/摘要/章节等。
 2. **上传 PDF / Word**：调用 `POST /api/news/upload-document`，请求头带 `X-IPMS-Import-Channel: chrome-extension`，与系统管理手工上传**同一解析与 LLM 分析链路**，入库为 `source = ChromeExtension`、`recordCategory = report`，并写入 `uploaderUserId`（当前登录用户）。
 
-## 使用前准备
+## 使用前准备（终端用户）
 
-1. 启动 IPMS 后端（如 `pnpm dev`），在浏览器 **正常打开 IPMS 并完成登录**（与插件里填写的根地址一致，例如 `http://127.0.0.1:3000`）。
-2. 点击扩展图标，在弹窗中 **保存根地址**（不要末尾 `/`）。
-3. 数据库需已执行枚举扩展（含 `ChromeExtension`）：在项目根运行 `pnpm run db:ensure-schema` 或应用迁移 `0015_news_source_chrome_extension.sql`。
+1. 在浏览器 **正常打开 IPMS 并完成登录**（地址需与插件里填写的一致）。
+2. 点击扩展图标，在弹窗中 **保存网站根地址**（不要末尾 `/`）。
+
+## 管理员 / 部署说明
+
+若用户已按说明安装仍**无法保存资讯**，请在服务器项目根执行 `pnpm run db:ensure-schema`（或应用迁移 `0015_news_source_chrome_extension.sql`），确保 `news_articles.source` 枚举包含 `ChromeExtension`。终端用户无需执行此步骤。
 
 ## 权限说明
 

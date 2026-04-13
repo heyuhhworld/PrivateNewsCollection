@@ -24,9 +24,23 @@ function setMsg(text, cls) {
   el.className = cls || "";
 }
 
+async function refreshCropCount() {
+  const { ipmsScreenshots = [] } = await chrome.storage.local.get("ipmsScreenshots");
+  const countEl = document.getElementById("crop-count");
+  const clearEl = document.getElementById("crop-clear");
+  if (ipmsScreenshots.length > 0) {
+    countEl.textContent = `已截图 ${ipmsScreenshots.length} 张`;
+    clearEl.style.display = "";
+  } else {
+    countEl.textContent = "";
+    clearEl.style.display = "none";
+  }
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   const baseInput = document.getElementById("base");
   baseInput.value = await getBase();
+  await refreshCropCount();
 
   document.getElementById("save").addEventListener("click", async () => {
     const v = normBase(baseInput.value);
@@ -36,6 +50,29 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
     await chrome.storage.sync.set({ ipmsBaseUrl: v });
     setMsg("已保存：" + v, "ok");
+  });
+
+  document.getElementById("crop").addEventListener("click", async () => {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) {
+      setMsg("无法获取当前标签页", "err");
+      return;
+    }
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["crop.js"],
+      });
+      window.close();
+    } catch (e) {
+      setMsg("无法在此页面截图：" + (e.message || e), "err");
+    }
+  });
+
+  document.getElementById("crop-clear").addEventListener("click", async () => {
+    await chrome.storage.local.set({ ipmsScreenshots: [] });
+    await refreshCropCount();
+    setMsg("截图已清除", "ok");
   });
 
   document.getElementById("tab").addEventListener("click", async () => {
@@ -53,7 +90,13 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
       if (!res?.ok) setMsg(res?.error || "失败", "err");
       else if (res.duplicate) setMsg("该 URL 已在库中（未重复写入）", "ok");
-      else setMsg("导入成功，ID " + (res.articleId ?? "") + "：" + (res.title || ""), "ok");
+      else {
+        const shotInfo = res.screenshotsUploaded
+          ? `（含 ${res.screenshotsUploaded} 张截图）`
+          : "";
+        setMsg(`导入成功${shotInfo}，ID ${res.articleId ?? ""}：${res.title || ""}`, "ok");
+      }
+      refreshCropCount();
     });
   });
 

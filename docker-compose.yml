@@ -7,6 +7,8 @@
 # 并在项目根目录 .env 中配置 DATABASE_URL（示例见 .env.example）。
 #
 # 若容器已存在但未运行：docker start ipms-local-mysql
+# 一键重启应用+库：在项目根执行 pnpm run dev:restart，并在 .env 配置
+#   DOCKER_MYSQL_CONTAINER=ipms-local-mysql（与下方容器名一致即可）
 #
 # 历史说明：曾在此文件中定义 ipms-mysql（库 ipms / 空数据），已与真实库混淆；
 # 该服务已移除。若本地仍残留同名容器或匿名卷，可自行 docker rm / docker volume prune。

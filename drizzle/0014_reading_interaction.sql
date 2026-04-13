@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS `article_pdf_highlights` (
   `note` text,
   `createdAt` timestamp NOT NULL DEFAULT (now()),
   CONSTRAINT `article_pdf_highlights_id` PRIMARY KEY(`id`)
-);
+);--> statement-breakpoint
 
 CREATE TABLE IF NOT EXISTS `article_reading_images` (
   `id` int AUTO_INCREMENT NOT NULL,
@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS `article_reading_images` (
   `sourceRect` json,
   `createdAt` timestamp NOT NULL DEFAULT (now()),
   CONSTRAINT `article_reading_images_id` PRIMARY KEY(`id`)
-);
+);--> statement-breakpoint
 
 CREATE TABLE IF NOT EXISTS `reading_events` (
   `id` int AUTO_INCREMENT NOT NULL,
@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS `reading_events` (
   `payload` json,
   `createdAt` timestamp NOT NULL DEFAULT (now()),
   CONSTRAINT `reading_events_id` PRIMARY KEY(`id`)
-);
+);--> statement-breakpoint
 
 CREATE TABLE IF NOT EXISTS `user_reading_profiles` (
   `userId` int NOT NULL,

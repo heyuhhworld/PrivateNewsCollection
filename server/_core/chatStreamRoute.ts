@@ -4,16 +4,23 @@ import {
   saveChatMessage,
   getUserReadingProfile,
   insertReadingEvent,
+  searchReadingImages,
 } from "../db";
 import { invokeLLMStream } from "./llm";
+import { getChromeExtensionUserGuideMarkdown } from "@shared/chromeExtensionUserGuide";
 import {
   appendCitedArticleLinks,
   buildArticleRefMap,
+  buildChromeExtensionAssistantBlock,
   buildNewsContextBlock,
   collectCitationsFromAnswer,
   GLOBAL_CHAT_SYSTEM_RULES,
+  guessChromeExtensionOrProductQuestion,
   resolveRelevantArticlesForChat,
 } from "./chatShared";
+import { maybeBuildHotAnalyticsAnswer } from "./hotViewAnalytics";
+import { maybeBuildMyArticlesAnswer } from "./myArticlesQuery";
+import { isImageRelatedQuery, buildImageContextBlock } from "./imageQueryHelper";
 
 function sendSse(res: Response, obj: Record<string, unknown>) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
@@ -52,6 +59,7 @@ export function registerChatStreamRoute(app: Express) {
     if (typeof res.flushHeaders === "function") res.flushHeaders();
 
     const msg = message.trim().slice(0, 2000);
+      const hotAnswer = await maybeBuildHotAnalyticsAnswer(msg);
 
     try {
       const uid = typeof userId === "number" ? userId : null;
@@ -72,9 +80,43 @@ export function registerChatStreamRoute(app: Express) {
         content: msg,
       });
 
+      const siteOrigin = typeof origin === "string" ? origin.trim() : "";
+      const quickAnswer = hotAnswer ?? (await maybeBuildMyArticlesAnswer(msg, uid));
+      if (quickAnswer) {
+        await saveChatMessage({
+          sessionId,
+          userId: uid,
+          role: "assistant",
+          content: quickAnswer,
+        });
+        sendSse(res, { type: "chunk", text: quickAnswer });
+        sendSse(res, { type: "done", content: quickAnswer, citations: [] });
+        res.end();
+        return;
+      }
+      const extGuide = buildChromeExtensionAssistantBlock(siteOrigin);
+
       const relevantArticles = await resolveRelevantArticlesForChat(msg);
       if (relevantArticles.length === 0) {
-        const fallback = "资讯库未提供与该问题直接相关的信息。";
+        if (guessChromeExtensionOrProductQuestion(msg)) {
+          const full = getChromeExtensionUserGuideMarkdown(siteOrigin);
+          sendSse(res, { type: "chunk", text: full });
+          await saveChatMessage({
+            sessionId,
+            userId: uid,
+            role: "assistant",
+            content: full,
+          });
+          sendSse(res, {
+            type: "done",
+            content: full,
+            citations: [],
+          });
+          res.end();
+          return;
+        }
+        const fallback =
+          "未在资讯库中检索到与问题直接匹配的条目。若需访问热度、PV/UV、停留时长等统计，请在问题中包含「统计」「热度」「表格」等词。";
         await saveChatMessage({
           sessionId,
           userId: uid,
@@ -96,6 +138,15 @@ export function registerChatStreamRoute(app: Express) {
         content: m.content,
       }));
 
+      let imageBlock = "";
+      if (isImageRelatedQuery(msg)) {
+        const imgCtx = await buildImageContextBlock(msg, {
+          userId: uid ?? undefined,
+          siteOrigin,
+        });
+        imageBlock = imgCtx.block;
+      }
+
       let full = "";
       const stream = invokeLLMStream({
         messages: [
@@ -103,8 +154,10 @@ export function registerChatStreamRoute(app: Express) {
             role: "system",
             content: `${GLOBAL_CHAT_SYSTEM_RULES}${readingHint}
 
+${extGuide}
+
 相关资讯数据（供参考）：
-${newsContext || "（暂无相关资讯）"}`,
+${newsContext || "（暂无相关资讯）"}${imageBlock}`,
           },
           ...historyMessages,
           { role: "user", content: msg },

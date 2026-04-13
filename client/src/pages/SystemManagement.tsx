@@ -4,6 +4,7 @@ import { useLocation } from "wouter";
 import { trpc } from "@/lib/trpc";
 import { useAuth } from "@/_core/hooks/useAuth";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -93,7 +94,6 @@ type ImportQueueRow = {
   articleId?: number;
   file?: File;
   url?: string;
-  source?: "Preqin" | "Pitchbook";
 };
 
 function isAllowedImportFile(f: File): boolean {
@@ -167,6 +167,18 @@ function LogStatusBadge({ status }: { status: string }) {
   return <span className="text-blue-600 text-xs font-medium flex items-center gap-1"><Loader2 className="h-3 w-3 animate-spin" />执行中</span>;
 }
 
+function isAdminReimportableArticle(row: {
+  recordCategory: string;
+  source: string;
+  originalUrl: string | null;
+}) {
+  return (
+    row.recordCategory === "news" &&
+    (row.source === "Preqin" || row.source === "Pitchbook") &&
+    Boolean((row.originalUrl ?? "").trim())
+  );
+}
+
 export default function SystemManagement() {
   const { user } = useAuth();
   const [, setLocation] = useLocation();
@@ -175,6 +187,7 @@ export default function SystemManagement() {
   const [activeTab, setActiveTab] = useState<"jobs" | "import" | "records">("jobs");
   const [recordAdminPage, setRecordAdminPage] = useState(1);
   const [recordVisibility, setRecordVisibility] = useState<"all" | "visible" | "hidden">("all");
+  const [selectedRecordIds, setSelectedRecordIds] = useState<Set<number>>(() => new Set());
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [editingJob, setEditingJob] = useState<any>(null);
   const [deletingJobId, setDeletingJobId] = useState<number | null>(null);
@@ -186,7 +199,6 @@ export default function SystemManagement() {
   const [clearPreqinPassword, setClearPreqinPassword] = useState(false);
   // Manual import state
   const [importUrls, setImportUrls] = useState("");
-  const [importSource, setImportSource] = useState<"Preqin" | "Pitchbook">("Pitchbook");
   const [importQueue, setImportQueue] = useState<ImportQueueRow[]>([]);
   const importQueueRef = useRef<ImportQueueRow[]>([]);
   const importWorkerLockRef = useRef(false);
@@ -274,11 +286,6 @@ export default function SystemManagement() {
     onSuccess: () => refetch(),
   });
 
-  const { data: importSessionStatus } = trpc.news.importSessionStatus.useQuery(
-    undefined,
-    { enabled: activeTab === "import", refetchInterval: 30_000 }
-  );
-
   const importByUrlMutation = trpc.news.importByUrl.useMutation();
 
   const { data: adminArticleData, refetch: refetchAdminArticles } =
@@ -302,6 +309,46 @@ export default function SystemManagement() {
     },
     onError: (e) => toast.error(e.message),
   });
+
+  const batchSetHiddenMutation = trpc.news.adminSetArticlesHidden.useMutation({
+    onSuccess: (_, v) => {
+      toast.success(v.hidden ? "已批量隐藏" : "已批量恢复展示");
+      setSelectedRecordIds(new Set());
+      void refetchAdminArticles();
+    },
+    onError: (e) => toast.error(e.message),
+  });
+
+  const batchDeleteMutation = trpc.news.adminDeleteArticles.useMutation({
+    onSuccess: () => {
+      toast.success("已批量删除");
+      setSelectedRecordIds(new Set());
+      void refetchAdminArticles();
+    },
+    onError: (e) => toast.error(e.message),
+  });
+
+  const batchReimportMutation = trpc.news.adminBatchReimportArticles.useMutation({
+    onSuccess: (res) => {
+      toast.success(
+        `重新导入完成：成功 ${res.success}，跳过 ${res.skipped}，失败 ${res.failed}`
+      );
+      setSelectedRecordIds(new Set());
+      void refetchAdminArticles();
+    },
+    onError: (e) => toast.error(e.message),
+  });
+
+  const recordsTabBusy =
+    setArticleHiddenMutation.isPending ||
+    deleteArticleAdminMutation.isPending ||
+    batchSetHiddenMutation.isPending ||
+    batchDeleteMutation.isPending ||
+    batchReimportMutation.isPending;
+
+  useEffect(() => {
+    setSelectedRecordIds(new Set());
+  }, [recordAdminPage, recordVisibility]);
 
   useEffect(() => {
     if (activeTab === "records" && user?.role !== "admin") {
@@ -366,7 +413,6 @@ export default function SystemManagement() {
         } else {
           const out = await importByUrlMutation.mutateAsync({
             urls: [row.url!],
-            source: row.source ?? "Pitchbook",
           });
           const r = out.results[0];
           patchImportRow(row.id, {
@@ -453,7 +499,6 @@ export default function SystemManagement() {
       kind: "url",
       label: url,
       url,
-      source: importSource,
       status: "queued",
     }));
     appendImportQueue(rows);
@@ -782,60 +827,9 @@ export default function SystemManagement() {
             </div>
 
             <div className="bg-white rounded-lg border border-gray-100 p-6">
-              <div className="flex items-center gap-2 mb-1">
+              <div className="flex items-center gap-2 mb-4">
                 <Globe className="h-4 w-4 text-[#1677ff]" />
                 <h2 className="text-sm font-semibold text-gray-800">链接导入文章</h2>
-              </div>
-              <p className="text-xs text-gray-500 mb-4">
-                粘贴 Preqin 或 Pitchbook 文章链接，点击「加入队列」后与文件导入共用<strong>同一顺序队列</strong>（先加入先执行）。每批最多 10 条 URL，可多批追加。
-              </p>
-
-              <div className="rounded-lg border border-amber-100 bg-amber-50/70 p-3 mb-4 text-xs text-amber-950 space-y-2">
-                <p className="font-medium text-amber-950">首次登录（本机一次，后续自动复用）</p>
-                <p className="text-amber-900/90 leading-relaxed">
-                  在<strong>运行本服务的电脑</strong>上打开终端，执行下方命令后会弹出真实浏览器。请在窗口内完成登录与验证，回到终端按 Enter
-                  保存会话；之后链接导入与无头抓取会沿用该账号，无需每次再登录。
-                </p>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-amber-900/80 shrink-0">Pitchbook</span>
-                  <Badge
-                    variant={importSessionStatus?.pitchbook ? "default" : "secondary"}
-                    className="text-[10px] h-5"
-                  >
-                    {importSessionStatus?.pitchbook ? "已保存登录态" : "未保存"}
-                  </Badge>
-                  <code className="text-[10px] sm:text-xs bg-white/90 px-2 py-0.5 rounded border border-amber-200/80 font-mono break-all">
-                    pnpm run import:session -- pitchbook
-                  </code>
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-amber-900/80 shrink-0">Preqin</span>
-                  <Badge
-                    variant={importSessionStatus?.preqin ? "default" : "secondary"}
-                    className="text-[10px] h-5"
-                  >
-                    {importSessionStatus?.preqin ? "已保存登录态" : "未保存"}
-                  </Badge>
-                  <code className="text-[10px] sm:text-xs bg-white/90 px-2 py-0.5 rounded border border-amber-200/80 font-mono break-all">
-                    pnpm run import:session -- preqin
-                  </code>
-                </div>
-                <p className="text-[11px] text-amber-800/85 leading-relaxed">
-                  外网需代理时先在 .env 配置 IMPORT_FETCH_PROXY；会话保存在 data/import-sessions/*.json（含 Cookie，已加入 .gitignore）。
-                </p>
-              </div>
-
-              <div className="mb-4">
-                <label className="block text-xs font-medium text-gray-600 mb-1">资讯来源</label>
-                <Select value={importSource} onValueChange={(v) => setImportSource(v as any)}>
-                  <SelectTrigger className="h-8 text-xs w-40">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="Pitchbook">Pitchbook</SelectItem>
-                    <SelectItem value="Preqin">Preqin</SelectItem>
-                  </SelectContent>
-                </Select>
               </div>
 
               <div className="mb-4">
@@ -1320,9 +1314,100 @@ export default function SystemManagement() {
                   </SelectContent>
                 </Select>
                 <span className="text-xs text-gray-400 ml-auto">
-                  删除 / 隐藏 / 恢复对全员生效；隐藏后列表与详情均不可访问（管理员仍可在此查看）。
+                  删除 / 隐藏 / 恢复对全员生效；隐藏后列表与详情均不可访问（管理员仍可在此查看）。重新导入仅对带有效链接的
+                  Preqin / Pitchbook 资讯生效，将重新抓取网页并覆盖正文与元数据（不更换 ID）。
                 </span>
               </div>
+
+              {adminArticleData && adminArticleData.items.length > 0 && selectedRecordIds.size > 0 && (
+                <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50/80 px-3 py-2 text-xs text-amber-900">
+                  <span className="font-medium">已选 {selectedRecordIds.size} 条</span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-xs"
+                    disabled={recordsTabBusy}
+                    onClick={() => setSelectedRecordIds(new Set())}
+                  >
+                    取消选择
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    disabled={recordsTabBusy}
+                    onClick={() => {
+                      const ids = Array.from(selectedRecordIds);
+                      batchSetHiddenMutation.mutate({ ids, hidden: true });
+                    }}
+                  >
+                    批量隐藏
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    disabled={recordsTabBusy}
+                    onClick={() => {
+                      const ids = Array.from(selectedRecordIds);
+                      batchSetHiddenMutation.mutate({ ids, hidden: false });
+                    }}
+                  >
+                    批量恢复展示
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs inline-flex items-center gap-1"
+                    disabled={recordsTabBusy}
+                    onClick={() => {
+                      const rows =
+                        adminArticleData?.items.filter((r) => selectedRecordIds.has(r.id)) ?? [];
+                      const eligible = rows.filter(isAdminReimportableArticle).map((r) => r.id);
+                      if (eligible.length === 0) {
+                        toast.error("当前选中项中没有可重新导入的 Preqin/Pitchbook 链接资讯");
+                        return;
+                      }
+                      const run = eligible.slice(0, 15);
+                      if (
+                        !confirm(
+                          `将对 ${run.length} 条记录重新抓取网页并原地更新（最多 15 条/次）。` +
+                            (eligible.length > run.length
+                              ? `另有 ${eligible.length - run.length} 条本次不会处理。`
+                              : "") +
+                            " 是否继续？"
+                        )
+                      ) {
+                        return;
+                      }
+                      batchReimportMutation.mutate({ ids: run });
+                    }}
+                  >
+                    {batchReimportMutation.isPending ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : null}
+                    批量重新导入
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    size="sm"
+                    className="h-7 text-xs"
+                    disabled={recordsTabBusy}
+                    onClick={() => {
+                      const n = selectedRecordIds.size;
+                      if (!confirm(`确定批量删除已选的 ${n} 条记录？不可恢复。`)) return;
+                      batchDeleteMutation.mutate({ ids: Array.from(selectedRecordIds) });
+                    }}
+                  >
+                    批量删除
+                  </Button>
+                </div>
+              )}
 
               {!adminArticleData ? (
                 <div className="space-y-2">
@@ -1333,11 +1418,60 @@ export default function SystemManagement() {
                 <p className="text-sm text-gray-400 py-8 text-center">暂无记录</p>
               ) : (
                 <div className="divide-y divide-gray-50 border border-gray-100 rounded-lg overflow-hidden">
+                  <div className="flex items-center gap-3 bg-gray-50/90 px-4 py-2">
+                    <Checkbox
+                      id="admin-records-select-page"
+                      disabled={recordsTabBusy}
+                      checked={(() => {
+                        const ids = adminArticleData.items.map((r) => r.id);
+                        if (ids.length === 0) return false;
+                        const all = ids.every((id) => selectedRecordIds.has(id));
+                        const some = ids.some((id) => selectedRecordIds.has(id));
+                        return all ? true : some ? "indeterminate" : false;
+                      })()}
+                      onCheckedChange={(v) => {
+                        const checked = v === true;
+                        const pageIds = adminArticleData.items.map((r) => r.id);
+                        setSelectedRecordIds((prev) => {
+                          const next = new Set(prev);
+                          if (checked) pageIds.forEach((id) => next.add(id));
+                          else pageIds.forEach((id) => next.delete(id));
+                          return next;
+                        });
+                      }}
+                    />
+                    <label
+                      htmlFor="admin-records-select-page"
+                      className="text-xs text-gray-600 cursor-pointer select-none"
+                    >
+                      全选本页
+                    </label>
+                  </div>
                   {adminArticleData.items.map((row) => (
                     <div
                       key={row.id}
                       className="px-4 py-3 flex flex-wrap items-start gap-3 bg-white hover:bg-gray-50/80"
                     >
+                      <div
+                        className="pt-0.5 shrink-0"
+                        onClick={(e) => e.stopPropagation()}
+                        onPointerDown={(e) => e.stopPropagation()}
+                      >
+                        <Checkbox
+                          disabled={recordsTabBusy}
+                          checked={selectedRecordIds.has(row.id)}
+                          onCheckedChange={(v) => {
+                            const on = v === true;
+                            setSelectedRecordIds((prev) => {
+                              const next = new Set(prev);
+                              if (on) next.add(row.id);
+                              else next.delete(row.id);
+                              return next;
+                            });
+                          }}
+                          aria-label={`选择 ID ${row.id}`}
+                        />
+                      </div>
                       <div className="flex-1 min-w-0">
                         <button
                           type="button"
@@ -1387,7 +1521,7 @@ export default function SystemManagement() {
                             variant="outline"
                             size="sm"
                             className="h-7 text-xs"
-                            disabled={setArticleHiddenMutation.isPending}
+                            disabled={recordsTabBusy}
                             onClick={() =>
                               setArticleHiddenMutation.mutate({ id: row.id, hidden: false })
                             }
@@ -1399,7 +1533,7 @@ export default function SystemManagement() {
                             variant="outline"
                             size="sm"
                             className="h-7 text-xs"
-                            disabled={setArticleHiddenMutation.isPending}
+                            disabled={recordsTabBusy}
                             onClick={() =>
                               setArticleHiddenMutation.mutate({ id: row.id, hidden: true })
                             }
@@ -1411,7 +1545,7 @@ export default function SystemManagement() {
                           variant="ghost"
                           size="sm"
                           className="h-7 text-xs text-red-600 hover:text-red-700 hover:bg-red-50"
-                          disabled={deleteArticleAdminMutation.isPending}
+                          disabled={recordsTabBusy}
                           onClick={() => {
                             if (
                               !confirm(

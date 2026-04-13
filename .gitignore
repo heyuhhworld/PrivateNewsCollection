@@ -14,7 +14,8 @@ uploads/news/*
 # 资讯导入：本机保存的站点登录态（含 Cookie，勿提交）
 data/import-sessions/*.json
 
-# Environment variables
+# Environment variables（勿提交；git pull/merge 不会覆盖本机 .env）
+# 勿执行 git add -f .env；慎用 git clean -fdx 会删除被忽略的 .env
 .env
 .env.local
 .env.development.local

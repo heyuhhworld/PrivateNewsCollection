@@ -1,5 +1,5 @@
 -- 资讯语义检索 embedding + AI 简报表
-ALTER TABLE `news_articles` ADD COLUMN `embedding` JSON NULL AFTER `viewCount`;
+ALTER TABLE `news_articles` ADD COLUMN `embedding` JSON NULL AFTER `viewCount`;--> statement-breakpoint
 
 CREATE TABLE IF NOT EXISTS `ai_briefings` (
   `id` int AUTO_INCREMENT NOT NULL,

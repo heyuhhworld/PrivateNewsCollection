@@ -15,16 +15,16 @@ import {
   Network,
   Newspaper,
   Pencil,
+  RefreshCw,
+  Trash2,
   User,
-  GripVertical,
-  PanelRightClose,
-  PanelRightOpen,
   Sparkles,
   Upload,
   X,
   Puzzle,
 } from "lucide-react";
 import { Streamdown } from "streamdown";
+import { getRehypePluginsWithOrigin } from "@/lib/streamdownPlugins";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
 import { cn } from "@/lib/utils";
@@ -78,15 +78,21 @@ interface ArticleSection {
   body: string;
 }
 
-type MainTab = "ai" | "body";
-
-const SPLIT_PCT_KEY = "ipms_news_detail_split_pct";
-const SPLIT_DEFAULT = 54;
-const SPLIT_MIN = 26;
-const SPLIT_MAX = 74;
+type MainTab = "ai" | "body" | "preview" | "images";
 
 /** 左侧文本预览分块行数；引用定位跳转需与此一致 */
 const PREVIEW_LINES_PER_CHUNK = 14;
+
+function isPdfLikeFile(
+  mime?: string | null,
+  fileUrl?: string | null,
+  originalName?: string | null
+): boolean {
+  const m = String(mime ?? "").toLowerCase();
+  const u = String(fileUrl ?? "").toLowerCase();
+  const n = String(originalName ?? "").toLowerCase();
+  return m.includes("pdf") || u.includes(".pdf") || n.endsWith(".pdf");
+}
 
 export default function NewsDetail() {
   const params = useParams<{ id: string }>();
@@ -95,8 +101,6 @@ export default function NewsDetail() {
   const sessionId = useMemo(() => getSessionId(), []);
   /** 报告式详情：AI导读 / 资讯正文 */
   const [mainTab, setMainTab] = useState<MainTab>("ai");
-  const [splitPct, setSplitPct] = useState(SPLIT_DEFAULT);
-  const [insightPanelOpen, setInsightPanelOpen] = useState(true);
   /** PDF 内嵌预览页码（浏览器内置查看器支持 #page= 时生效，仅为大致定位） */
   const [pdfPage, setPdfPage] = useState(1);
   /** 与 chat 引用 L 行号一致：基于「非空行」连续编号（同 server/routers/chat.ts） */
@@ -106,10 +110,6 @@ export default function NewsDetail() {
     page: number;
     quote?: string;
   } | null>(null);
-  const splitRef = useRef<HTMLDivElement>(null);
-  const splitDragRef = useRef<{ startX: number; startPct: number; lastPct: number } | null>(
-    null
-  );
 
   const { data: article, isLoading, error } = trpc.news.detail.useQuery(
     { id },
@@ -126,7 +126,12 @@ export default function NewsDetail() {
     { enabled: id > 0 }
   );
 
-  const isPdf = Boolean(article && String(article.attachmentMime ?? "").toLowerCase().includes("pdf"));
+  const attachmentPublicUrl = (article as { attachmentPublicUrl?: string | null } | undefined)
+    ?.attachmentPublicUrl;
+  const attachmentMime = (article as { attachmentMime?: string | null } | undefined)?.attachmentMime;
+  const attachmentOriginalName = (article as { attachmentOriginalName?: string | null } | undefined)
+    ?.attachmentOriginalName;
+  const isPdf = isPdfLikeFile(attachmentMime, attachmentPublicUrl, attachmentOriginalName);
 
   const { data: pdfHighlights } = trpc.reading.pdfHighlightsList.useQuery(
     { articleId: id },
@@ -135,10 +140,12 @@ export default function NewsDetail() {
 
   const { data: readingImages } = trpc.reading.readingImagesList.useQuery(
     { articleId: id },
-    { enabled: id > 0 && isPdf }
+    { enabled: id > 0 }
   );
 
   const logReadingEvent = trpc.reading.logEvent.useMutation();
+  const updateReadingImageMutation = trpc.reading.readingImageUpdate.useMutation();
+  const deleteReadingImageMutation = trpc.reading.readingImageDelete.useMutation();
 
   const persistedPdfHighlights = useMemo((): PersistedPdfHighlight[] => {
     if (!pdfHighlights?.length) return [];
@@ -165,6 +172,8 @@ export default function NewsDetail() {
   const [editStrategy, setEditStrategy] = useState<string | null>(null);
   const [editRegion, setEditRegion] = useState<string | null>(null);
   const [newTag, setNewTag] = useState("");
+  const [editingImageId, setEditingImageId] = useState<number | null>(null);
+  const [editingImageCaption, setEditingImageCaption] = useState("");
 
   const { data: bookmarked, refetch: refetchBookmark } =
     trpc.news.isBookmarked.useQuery(
@@ -190,6 +199,13 @@ export default function NewsDetail() {
   const recordView = trpc.news.recordView.useMutation();
   const lastRecordedViewId = useRef<number | null>(null);
   const articleOpenLoggedRef = useRef<number | null>(null);
+  const viewEntrySource = useMemo<"list" | "chat" | "other">(() => {
+    if (typeof window === "undefined") return "other";
+    const q = new URLSearchParams(window.location.search).get("entry");
+    if (q === "list") return "list";
+    if (q === "chat") return "chat";
+    return "other";
+  }, [id]);
 
   useEffect(() => {
     if (article && !article.isRead) {
@@ -201,8 +217,8 @@ export default function NewsDetail() {
     if (!article?.id) return;
     if (lastRecordedViewId.current === article.id) return;
     lastRecordedViewId.current = article.id;
-    recordView.mutate({ id: article.id });
-  }, [article?.id]);
+    recordView.mutate({ id: article.id, sessionId, entrySource: viewEntrySource });
+  }, [article?.id, sessionId, viewEntrySource]);
 
   useEffect(() => {
     if (!article?.id) return;
@@ -216,9 +232,9 @@ export default function NewsDetail() {
     });
   }, [article?.id, article?.recordCategory, sessionId]);
 
-  /** PDF 详情页停留：约每 10s 合并一条，仅前台可见时累计（节流，避免流水过大） */
+  /** 详情页停留埋点：约每 10s 一条（前台可见时），用于 PV/UV 外的平均查看时长分析 */
   useEffect(() => {
-    if (!article?.id || !isPdf) return;
+    if (!article?.id) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState !== "visible") return;
       logReadingEvent.mutate({
@@ -230,7 +246,7 @@ export default function NewsDetail() {
       });
     }, 10_000);
     return () => clearInterval(timer);
-  }, [article?.id, article?.recordCategory, sessionId, isPdf]);
+  }, [article?.id, article?.recordCategory, sessionId]);
 
   const handleBookmarkToggle = () => {
     if (bookmarked) {
@@ -253,13 +269,8 @@ export default function NewsDetail() {
   }, [article?.tags, article?.strategy, article?.region]);
   const sections = (article?.sections as ArticleSection[] | null) ?? [];
 
-  const attachmentPublicUrl = (article as { attachmentPublicUrl?: string | null } | undefined)
-    ?.attachmentPublicUrl;
   const extractedText = (article as { extractedText?: string | null } | undefined)?.extractedText;
   const articleContent = (article as { content?: string | null } | undefined)?.content;
-  const attachmentMime = (article as { attachmentMime?: string | null } | undefined)?.attachmentMime;
-  const attachmentOriginalName = (article as { attachmentOriginalName?: string | null } | undefined)
-    ?.attachmentOriginalName;
   const extractedLinePageMap = (
     article as { extractedLinePageMap?: number[] | null } | undefined
   )?.extractedLinePageMap;
@@ -267,20 +278,6 @@ export default function NewsDetail() {
   useEffect(() => {
     setPdfPage(1);
   }, [id]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(SPLIT_PCT_KEY);
-      if (raw) {
-        const n = parseFloat(raw);
-        if (!Number.isNaN(n)) {
-          setSplitPct(Math.min(SPLIT_MAX, Math.max(SPLIT_MIN, n)));
-        }
-      }
-    } catch {
-      /* ignore */
-    }
-  }, []);
 
   const citationSource = ((extractedText ?? articleContent) ?? "").trim();
   const citationLines = useMemo(
@@ -297,7 +294,7 @@ export default function NewsDetail() {
     return chunks;
   }, [citationLines]);
 
-  const isPdfPreview = Boolean(attachmentMime?.toLowerCase().includes("pdf"));
+  const isPdfPreview = isPdfLikeFile(attachmentMime, attachmentPublicUrl, attachmentOriginalName);
 
   useEffect(() => {
     const onLocate = (event: Event) => {
@@ -359,45 +356,51 @@ export default function NewsDetail() {
     return () => window.clearTimeout(t);
   }, [citationHighlight, isPdfPreview]);
 
-  const startSplitDrag = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    const el = splitRef.current;
-    if (!el) return;
-    splitDragRef.current = {
-      startX: e.clientX,
-      startPct: splitPct,
-      lastPct: splitPct,
-    };
-    const onMove = (ev: MouseEvent) => {
-      const d = splitDragRef.current;
-      if (!d) return;
-      const rect = el.getBoundingClientRect();
-      const dx = ev.clientX - d.startX;
-      const deltaPct = (dx / rect.width) * 100;
-      const next = Math.min(SPLIT_MAX, Math.max(SPLIT_MIN, d.startPct + deltaPct));
-      d.lastPct = next;
-      setSplitPct(next);
-    };
-    const onUp = () => {
-      const d = splitDragRef.current;
-      splitDragRef.current = null;
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      if (d) {
-        try {
-          localStorage.setItem(SPLIT_PCT_KEY, String(d.lastPct));
-        } catch {
-          /* ignore */
+  const [pasteUploading, setPasteUploading] = useState(false);
+
+  const handleImagePaste = useCallback(
+    async (e: React.ClipboardEvent | ClipboardEvent) => {
+      const items = (e as ClipboardEvent).clipboardData?.items ?? (e as React.ClipboardEvent).clipboardData?.items;
+      if (!items) return;
+      let file: File | null = null;
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.startsWith("image/")) {
+          file = items[i].getAsFile();
+          break;
         }
       }
-    };
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  }, [splitPct]);
+      if (!file) return;
+      e.preventDefault();
+      setPasteUploading(true);
+      try {
+        const fd = new FormData();
+        fd.append("file", file, "paste.png");
+        fd.append("articleId", String(id));
+        fd.append("caption", "粘贴上传");
+        fd.append("sessionId", sessionId);
+        const res = await fetch("/api/news/reading-image", { method: "POST", body: fd });
+        if (!res.ok) throw new Error("上传失败");
+        toast.success("图片已保存到图片流");
+        void utils.reading.readingImagesList.invalidate({ articleId: id });
+      } catch {
+        toast.error("图片上传失败");
+      } finally {
+        setPasteUploading(false);
+      }
+    },
+    [id, sessionId, utils],
+  );
+
+  useEffect(() => {
+    if (mainTab !== "images") return;
+    const handler = (e: ClipboardEvent) => { handleImagePaste(e); };
+    document.addEventListener("paste", handler);
+    return () => document.removeEventListener("paste", handler);
+  }, [mainTab, handleImagePaste]);
 
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-[#f5f7fa] p-6">
+      <div className="h-full bg-[#f5f7fa] p-6 overflow-auto">
         <div className="max-w-3xl mx-auto">
           <Skeleton className="h-8 w-32 mb-6" />
           <div className="bg-white rounded-xl border border-gray-100 p-8">
@@ -414,7 +417,7 @@ export default function NewsDetail() {
 
   if (error || !article) {
     return (
-      <div className="min-h-screen bg-[#f5f7fa] flex items-center justify-center">
+      <div className="h-full bg-[#f5f7fa] flex items-center justify-center overflow-auto">
         <div className="text-center">
           <Newspaper className="h-12 w-12 text-gray-300 mx-auto mb-3" />
           <p className="text-gray-500">资讯不存在或已被删除</p>
@@ -435,17 +438,6 @@ export default function NewsDetail() {
     article.originalUrl && !article.originalUrl.startsWith("manual://");
   const hasFilePreview = Boolean(attachmentPublicUrl);
   const splitReportLayout = isUploadedDoc && hasFilePreview;
-
-  const getPreviewPanelEl = () =>
-    document.getElementById("news-original-preview") ||
-    document.getElementById("news-original-preview-mobile");
-
-  const scrollToOriginalPreview = () => {
-    getPreviewPanelEl()?.scrollIntoView({
-      behavior: "smooth",
-      block: "nearest",
-    });
-  };
 
   const tabBar = (
     <div className="flex gap-2 flex-wrap shrink-0">
@@ -471,8 +463,271 @@ export default function NewsDetail() {
             : "bg-gray-100 text-gray-600 hover:bg-gray-200"
         )}
       >
-        资讯正文
+        报告详情
       </button>
+      {hasFilePreview && (
+        <button
+          type="button"
+          onClick={() => setMainTab("preview")}
+          className={cn(
+            "px-3 py-1.5 rounded-lg text-xs font-medium transition-colors",
+            mainTab === "preview"
+              ? "bg-[#1677ff] text-white"
+              : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+          )}
+        >
+          文件预览
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={() => setMainTab("images")}
+        className={cn(
+          "px-3 py-1.5 rounded-lg text-xs font-medium transition-colors",
+          mainTab === "images"
+            ? "bg-[#1677ff] text-white"
+            : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+        )}
+      >
+        图片流{readingImages && readingImages.length > 0 ? ` (${readingImages.length})` : ""}
+      </button>
+    </div>
+  );
+
+  const previewUrl = attachmentPublicUrl ?? "";
+
+  const previewPanelContentEl = hasFilePreview ? (
+    <div className="flex h-full min-h-0 flex-1 flex-col gap-2 overflow-hidden bg-gray-50/50 p-2">
+      {isPdfPreview ? (
+        <>
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            <PdfCitationViewer
+              url={previewUrl}
+              page={pdfPage}
+              onPageChange={setPdfPage}
+              citationHighlight={citationHighlight}
+              citationLines={citationLines}
+              articleId={id}
+              sessionId={sessionId}
+              persistedHighlights={persistedPdfHighlights}
+            />
+          </div>
+        </>
+      ) : (
+        <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-gray-200 bg-white p-3">
+          {textPreviewChunks.length > 0 ? (
+            textPreviewChunks.map((chunk, ci) => (
+              <div key={ci} id={`news-preview-chunk-${ci}`} className="mb-4 scroll-mt-2">
+                <div className="rounded-md border border-gray-100 overflow-hidden">
+                  {chunk.split("\n").map((line, li) => {
+                    const lineNo = ci * PREVIEW_LINES_PER_CHUNK + li + 1;
+                    const highlighted =
+                      !!citationHighlight &&
+                      lineNo >= citationHighlight.startLine &&
+                      lineNo <= citationHighlight.endLine;
+                    return (
+                      <div
+                        key={`${ci}-${li}`}
+                        data-citation-line={lineNo}
+                        className={cn(
+                          "grid grid-cols-[56px_1fr] gap-2 px-2 py-0.5 text-xs leading-relaxed transition-colors",
+                          highlighted
+                            ? "bg-amber-100 border-l-2 border-amber-400 shadow-[inset_0_0_0_1px_rgba(251,191,36,0.35)]"
+                            : "bg-white border-l-2 border-transparent"
+                        )}
+                      >
+                        <span className="text-gray-400 text-right select-none tabular-nums">
+                          {lineNo}
+                        </span>
+                        <span className="text-gray-800 whitespace-pre-wrap font-sans">
+                          {line || " "}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))
+          ) : (
+            <pre className="text-xs text-gray-700 whitespace-pre-wrap font-sans leading-relaxed">
+              {citationSource
+                ? citationSource
+                : "（无抽取文本，请下载查看）"}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  ) : null;
+
+  const imageStreamPanelEl = (
+    <div className="flex h-full min-h-0 flex-1 flex-col gap-2 overflow-hidden bg-gray-50/50 p-3">
+      <div className="rounded-lg border border-gray-200 bg-white p-3 min-h-0 flex-1 overflow-y-auto">
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="text-sm font-medium text-gray-700">
+            图片流
+            <span className="ml-1 text-xs text-gray-400">（团队共享 · {readingImages?.length ?? 0} 张）</span>
+          </div>
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 rounded border border-gray-200 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50"
+            onClick={() => void utils.reading.readingImagesList.invalidate({ articleId: id })}
+          >
+            <RefreshCw className="h-3 w-3" />
+            刷新
+          </button>
+        </div>
+
+        {pasteUploading && (
+          <div className="mb-2 rounded bg-blue-50 px-3 py-2 text-xs text-blue-700 animate-pulse">
+            正在上传粘贴的图片…
+          </div>
+        )}
+
+        {readingImages && readingImages.length > 0 ? (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {readingImages.map((img) => {
+              const tags = (img as { analysisTags?: string[] | null }).analysisTags;
+              const analysisText = (img as { analysisText?: string | null }).analysisText;
+              return (
+                <div
+                  key={img.id}
+                  className="group rounded-lg border border-gray-100 bg-gray-50/50 overflow-hidden hover:border-[#1677ff]/40 transition-colors"
+                >
+                  <a
+                    href={`/uploads/news/${img.storageKey}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block"
+                  >
+                    <img
+                      src={`/uploads/news/${img.storageKey}`}
+                      alt={img.caption ?? ""}
+                      className="h-36 w-full object-contain bg-white"
+                    />
+                  </a>
+                  <div className="px-2 py-1.5 space-y-1">
+                    {img.caption && (
+                      <p className="text-xs font-medium text-gray-700 truncate">{img.caption}</p>
+                    )}
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        className="inline-flex h-6 items-center gap-1 rounded border border-gray-200 px-1.5 text-[10px] text-gray-600 hover:border-[#1677ff]/40 hover:text-[#1677ff]"
+                        onClick={() => {
+                          setEditingImageId(img.id);
+                          setEditingImageCaption(img.caption ?? "");
+                        }}
+                      >
+                        <Pencil className="h-3 w-3" />
+                        编辑
+                      </button>
+                      <button
+                        type="button"
+                        className="inline-flex h-6 items-center gap-1 rounded border border-gray-200 px-1.5 text-[10px] text-gray-600 hover:border-rose-300 hover:text-rose-600"
+                        onClick={async () => {
+                          try {
+                            await deleteReadingImageMutation.mutateAsync({
+                              id: img.id,
+                              sessionId,
+                            });
+                            toast.success("图片已删除");
+                            await utils.reading.readingImagesList.invalidate({ articleId: id });
+                            if (editingImageId === img.id) {
+                              setEditingImageId(null);
+                              setEditingImageCaption("");
+                            }
+                          } catch (e) {
+                            toast.error(
+                              e instanceof Error ? e.message : "删除失败"
+                            );
+                          }
+                        }}
+                        disabled={deleteReadingImageMutation.isPending}
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        删除
+                      </button>
+                    </div>
+                    {editingImageId === img.id && (
+                      <div className="mt-1 space-y-1">
+                        <input
+                          value={editingImageCaption}
+                          onChange={(e) => setEditingImageCaption(e.target.value)}
+                          className="h-7 w-full rounded border border-gray-200 px-2 text-[11px] text-gray-700"
+                          placeholder="编辑图片说明"
+                        />
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            className="inline-flex h-6 items-center rounded bg-[#1677ff] px-2 text-[10px] text-white hover:bg-[#0958d9]"
+                            onClick={async () => {
+                              try {
+                                await updateReadingImageMutation.mutateAsync({
+                                  id: img.id,
+                                  caption: editingImageCaption,
+                                  sessionId,
+                                });
+                                toast.success("已更新图片说明");
+                                await utils.reading.readingImagesList.invalidate({ articleId: id });
+                                setEditingImageId(null);
+                              } catch (e) {
+                                toast.error(
+                                  e instanceof Error ? e.message : "更新失败"
+                                );
+                              }
+                            }}
+                            disabled={updateReadingImageMutation.isPending}
+                          >
+                            保存
+                          </button>
+                          <button
+                            type="button"
+                            className="inline-flex h-6 items-center rounded border border-gray-200 px-2 text-[10px] text-gray-600"
+                            onClick={() => {
+                              setEditingImageId(null);
+                              setEditingImageCaption("");
+                            }}
+                          >
+                            取消
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {analysisText && (
+                      <p className="text-[11px] text-gray-500 line-clamp-2" title={analysisText}>{analysisText}</p>
+                    )}
+                    {tags && tags.length > 0 && (
+                      <div className="flex flex-wrap gap-1">
+                        {tags.slice(0, 5).map((t, i) => (
+                          <span key={i} className="inline-block rounded bg-violet-50 px-1.5 py-0.5 text-[10px] text-violet-600">
+                            {t}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    <p className="text-[10px] text-gray-300">
+                      {img.sourcePage ? `P${img.sourcePage} · ` : ""}
+                      {new Date(img.createdAt).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                    </p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="rounded-lg border-2 border-dashed border-gray-200 px-4 py-12 text-center">
+            <p className="text-sm text-gray-400 mb-1">暂无图片</p>
+            <p className="text-xs text-gray-300">
+              可通过以下方式添加：Ctrl+V 粘贴截图、文件预览中区域截图、浏览器插件截图导入
+            </p>
+          </div>
+        )}
+
+        <div className="mt-3 rounded bg-gray-50 px-3 py-2 text-center text-[11px] text-gray-400">
+          💡 在此页签下按 Ctrl+V / ⌘+V 粘贴剪贴板图片即可保存
+        </div>
+      </div>
     </div>
   );
 
@@ -551,7 +806,7 @@ export default function NewsDetail() {
               <div className="px-5 py-4 space-y-4">
                 {relatedInsight.markdown ? (
                   <div className="prose prose-sm max-w-none text-gray-800 [&_a]:text-[#1677ff]">
-                    <Streamdown>{relatedInsight.markdown}</Streamdown>
+                    <Streamdown rehypePlugins={getRehypePluginsWithOrigin()}>{relatedInsight.markdown}</Streamdown>
                   </div>
                 ) : null}
                 {relatedInsight.related && relatedInsight.related.length > 0 && (
@@ -623,138 +878,24 @@ export default function NewsDetail() {
           )}
         </>
       )}
+      {mainTab === "preview" && previewPanelContentEl && (
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-gray-100 bg-white shadow-sm">
+          {previewPanelContentEl}
+        </div>
+      )}
+      {mainTab === "images" && (
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-gray-100 bg-white shadow-sm">
+          {imageStreamPanelEl}
+        </div>
+      )}
     </>
     );
   };
 
-  const previewUrl = attachmentPublicUrl ?? "";
-
-  const previewPanelInner = (
-    <>
-      <div className="px-4 py-3 border-b border-gray-50 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between gap-2 shrink-0">
-        <div className="min-w-0">
-          <span className="text-sm font-semibold text-gray-800">原文件预览</span>
-          {attachmentOriginalName && (
-            <p className="text-xs text-gray-400 truncate mt-0.5" title={attachmentOriginalName}>
-              {attachmentOriginalName}
-            </p>
-          )}
-        </div>
-        <div className="flex shrink-0 items-center gap-3 flex-wrap">
-          <button
-            type="button"
-            className="text-xs text-[#1677ff] hover:underline"
-            onClick={scrollToOriginalPreview}
-          >
-            回到预览
-          </button>
-          <a
-            href={previewUrl}
-            download
-            className="text-xs text-[#1677ff] hover:underline"
-          >
-            下载
-          </a>
-          <a
-            href={previewUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs text-[#1677ff] hover:underline"
-          >
-            新窗口
-          </a>
-        </div>
-      </div>
-      <div className="p-2 flex-1 min-h-0 bg-gray-50/50 flex flex-col overflow-hidden gap-2">
-        {attachmentMime?.includes("pdf") ? (
-          <>
-            <div className="flex w-full flex-1 min-h-[280px] shrink-0 flex-col">
-              <PdfCitationViewer
-                url={previewUrl}
-                page={pdfPage}
-                onPageChange={setPdfPage}
-                citationHighlight={citationHighlight}
-                citationLines={citationLines}
-                articleId={id}
-                sessionId={sessionId}
-                persistedHighlights={persistedPdfHighlights}
-              />
-            </div>
-            {readingImages && readingImages.length > 0 ? (
-              <div className="shrink-0 rounded-lg border border-gray-200 bg-white p-2">
-                <div className="mb-1 text-[11px] font-medium text-gray-600">图片流（团队共享）</div>
-                <div className="flex gap-2 overflow-x-auto pb-1">
-                  {readingImages.map((img) => (
-                    <a
-                      key={img.id}
-                      href={`/uploads/news/${img.storageKey}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="shrink-0"
-                    >
-                      <img
-                        src={`/uploads/news/${img.storageKey}`}
-                        alt={img.caption ?? ""}
-                        className="h-20 w-auto max-w-[140px] rounded border border-gray-100 object-contain"
-                      />
-                    </a>
-                  ))}
-                </div>
-              </div>
-            ) : null}
-          </>
-        ) : (
-          <div className="flex-1 min-h-0 overflow-auto rounded-lg border border-gray-200 bg-white p-3">
-            {textPreviewChunks.length > 0 ? (
-              textPreviewChunks.map((chunk, ci) => (
-                <div key={ci} id={`news-preview-chunk-${ci}`} className="mb-4 scroll-mt-2">
-                  <div className="rounded-md border border-gray-100 overflow-hidden">
-                    {chunk.split("\n").map((line, li) => {
-                      const lineNo = ci * PREVIEW_LINES_PER_CHUNK + li + 1;
-                      const highlighted =
-                        !!citationHighlight &&
-                        lineNo >= citationHighlight.startLine &&
-                        lineNo <= citationHighlight.endLine;
-                      return (
-                        <div
-                          key={`${ci}-${li}`}
-                          data-citation-line={lineNo}
-                          className={cn(
-                            "grid grid-cols-[56px_1fr] gap-2 px-2 py-0.5 text-xs leading-relaxed transition-colors",
-                            highlighted
-                              ? "bg-amber-100 border-l-2 border-amber-400 shadow-[inset_0_0_0_1px_rgba(251,191,36,0.35)]"
-                              : "bg-white border-l-2 border-transparent"
-                          )}
-                        >
-                          <span className="text-gray-400 text-right select-none tabular-nums">
-                            {lineNo}
-                          </span>
-                          <span className="text-gray-800 whitespace-pre-wrap font-sans">
-                            {line || " "}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))
-            ) : (
-              <pre className="text-xs text-gray-700 whitespace-pre-wrap font-sans leading-relaxed">
-                {citationSource
-                  ? citationSource
-                  : "（无抽取文本，请下载查看）"}
-              </pre>
-            )}
-          </div>
-        )}
-      </div>
-    </>
-  );
-
   return (
-    <div className="min-h-screen bg-[#f5f7fa]">
+    <div className="h-full flex flex-col bg-[#f5f7fa] overflow-hidden">
       {/* Top bar */}
-      <div className="bg-white border-b border-gray-200 px-6 py-3 flex items-center gap-3 sticky top-0 z-10">
+      <div className="bg-white border-b border-gray-200 px-6 py-3 flex items-center gap-3 shrink-0 z-10">
         <Button
           variant="ghost"
           size="sm"
@@ -767,23 +908,6 @@ export default function NewsDetail() {
         <div className="h-4 w-px bg-gray-200" />
         <span className="text-sm text-gray-400 truncate max-w-md">{article.title}</span>
         <div className="ml-auto flex items-center gap-2">
-          {splitReportLayout && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-8 gap-1.5 text-xs text-gray-600"
-              onClick={() => setInsightPanelOpen((o) => !o)}
-              title={insightPanelOpen ? "收起导读面板" : "展开导读面板"}
-            >
-              {insightPanelOpen ? (
-                <PanelRightClose className="h-3.5 w-3.5" />
-              ) : (
-                <PanelRightOpen className="h-3.5 w-3.5" />
-              )}
-              {insightPanelOpen ? "收起导读" : "展开导读"}
-            </Button>
-          )}
           <Button
             variant={bookmarked ? "default" : "outline"}
             size="sm"
@@ -805,6 +929,8 @@ export default function NewsDetail() {
         </div>
       </div>
 
+      {/* Scrollable content area */}
+      <div className="flex-1 overflow-auto">
       {/* Content */}
       <div
         className={cn(
@@ -864,6 +990,27 @@ export default function NewsDetail() {
                 跳转至原始资讯
                 <ExternalLink className="h-3 w-3" />
               </a>
+            )}
+            {hasFilePreview && (
+              <>
+                <a
+                  href={previewUrl}
+                  download
+                  className="flex items-center gap-1.5 text-[#1677ff] hover:text-[#0958d9] transition-colors font-medium"
+                >
+                  下载原文件
+                  <ExternalLink className="h-3 w-3" />
+                </a>
+                <a
+                  href={previewUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1.5 text-[#1677ff] hover:text-[#0958d9] transition-colors font-medium"
+                >
+                  新窗口打开
+                  <ExternalLink className="h-3 w-3" />
+                </a>
+              </>
             )}
           </div>
 
@@ -1028,62 +1175,26 @@ export default function NewsDetail() {
         {!splitReportLayout && tabBar}
 
         {splitReportLayout && attachmentPublicUrl ? (
-          <>
-            <div className="flex flex-col gap-4 lg:hidden">
-              <aside
-                id="news-original-preview-mobile"
-                className="min-w-0 rounded-xl border border-gray-100 bg-white shadow-sm overflow-hidden flex flex-col max-h-[70vh]"
-              >
-                {previewPanelInner}
-              </aside>
+          <div className="w-full rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden min-h-[calc(100dvh-3.75rem-3rem)] max-h-[calc(100dvh-3.75rem-3rem)] flex flex-col">
+            <div className="shrink-0 px-4 py-2.5 border-b border-gray-200 bg-white flex flex-wrap items-center gap-3">
               {tabBar}
-              <div className="min-w-0 space-y-4">{renderArticleBody()}</div>
             </div>
-
             <div
-              ref={splitRef}
-              className="hidden lg:flex w-full rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden min-h-[calc(100dvh-3.75rem-3rem)] max-h-[calc(100dvh-3.75rem-3rem)]"
-            >
-              <aside
-                id="news-original-preview"
-                className="min-w-0 min-h-0 flex flex-col bg-white overflow-hidden border-r border-gray-100"
-                style={{
-                  flex: insightPanelOpen ? `0 0 ${splitPct}%` : "1 1 100%",
-                }}
-              >
-                {previewPanelInner}
-              </aside>
-
-              {insightPanelOpen && (
-                <>
-                  <div
-                    role="separator"
-                    aria-orientation="vertical"
-                    aria-label="拖动调整左右宽度"
-                    onMouseDown={startSplitDrag}
-                    className="w-3 shrink-0 cursor-col-resize flex items-center justify-center border-l border-r border-gray-100 bg-gray-50/90 hover:bg-[#e8f0fe] active:bg-[#d6e8ff] transition-colors group"
-                  >
-                    <GripVertical className="h-6 w-6 text-gray-400 group-hover:text-[#1677ff]" />
-                  </div>
-                  <div className="min-w-0 min-h-0 flex-1 flex flex-col overflow-hidden bg-[#f5f7fa]">
-                    <div className="shrink-0 px-4 py-2.5 border-b border-gray-200 bg-white flex flex-wrap items-center gap-3">
-                      {tabBar}
-                      <span className="text-[11px] text-gray-400 ml-auto hidden xl:inline">
-                        拖拽中间竖条可调整预览与导读宽度
-                      </span>
-                    </div>
-                    <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
-                      {renderArticleBody()}
-                    </div>
-                  </div>
-                </>
+              className={cn(
+                "flex-1 min-h-0 p-4",
+                mainTab === "preview"
+                  ? "flex min-h-0 flex-col overflow-hidden"
+                  : "space-y-4 overflow-y-auto"
               )}
+            >
+              {renderArticleBody()}
             </div>
-          </>
+          </div>
         ) : (
           <div className="space-y-4">{renderArticleBody()}</div>
         )}
 
+      </div>
       </div>
     </div>
   );

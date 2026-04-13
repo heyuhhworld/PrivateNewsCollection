@@ -24,8 +24,6 @@ import { getLoginUrl, isOAuthLoginConfigured } from "@/const";
 import { toast } from "sonner";
 import { useIsMobile } from "@/hooks/useMobile";
 import {
-  MessageCircle,
-  Minimize2,
   Network,
   Newspaper,
   ChevronDown,
@@ -33,18 +31,15 @@ import {
   PanelLeft,
   Settings,
   ShieldCheck,
-  Sparkles,
 } from "lucide-react";
 import { CSSProperties, useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import { DashboardLayoutSkeleton } from "./DashboardLayoutSkeleton";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
-import NewsBot from "./NewsBot";
 
 const menuItems = [
   { icon: Newspaper, label: "资讯", path: "/news", beta: true },
-  { icon: Sparkles, label: "每日简报", path: "/briefing" },
   { icon: Network, label: "知识图谱", path: "/knowledge-graph" },
   { icon: Settings, label: "系统管理", path: "/system" },
 ];
@@ -276,6 +271,7 @@ export default function DashboardLayout({
 
   return (
     <SidebarProvider
+      className="!h-svh !min-h-0 overflow-hidden"
       style={
         {
           "--sidebar-width": `${sidebarWidth}px`,
@@ -305,18 +301,6 @@ function DashboardLayoutContent({
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const isMobile = useIsMobile();
-  const [botOpen, setBotOpen] = useState(false);
-  const [botSize, setBotSize] = useState({ width: 380, height: 560 });
-  const [isBotResizing, setIsBotResizing] = useState(false);
-  const botResizeStartRef = useRef<{
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  } | null>(null);
-  const isNewsRoute = location === "/news" || /^\/news\/\d+$/.test(location);
-  const detailMatch = location.match(/^\/news\/(\d+)$/);
-  const currentArticleId = detailMatch ? Number(detailMatch[1]) : undefined;
 
   useEffect(() => {
     if (isCollapsed) setIsResizing(false);
@@ -343,33 +327,6 @@ function DashboardLayoutContent({
       document.body.style.userSelect = "";
     };
   }, [isResizing, setSidebarWidth]);
-
-  useEffect(() => {
-    if (!isBotResizing) return;
-    const onMove = (e: MouseEvent) => {
-      const s = botResizeStartRef.current;
-      if (!s) return;
-      const nextWidth = Math.max(320, Math.min(760, s.width + (s.x - e.clientX)));
-      const nextHeight = Math.max(420, Math.min(window.innerHeight - 80, s.height + (s.y - e.clientY)));
-      setBotSize({ width: nextWidth, height: nextHeight });
-    };
-    const onUp = () => {
-      setIsBotResizing(false);
-      botResizeStartRef.current = null;
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-    document.body.style.cursor = "nwse-resize";
-    document.body.style.userSelect = "none";
-    return () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-  }, [isBotResizing]);
 
   // Determine active path (support /news/:id etc.)
   const activePath = menuItems.find((item) => {
@@ -498,7 +455,7 @@ function DashboardLayoutContent({
         />
       </div>
 
-      <SidebarInset className="bg-[#f5f7fa]">
+      <SidebarInset className="bg-[#f5f7fa] overflow-hidden">
         {isMobile && (
           <div className="flex border-b h-14 items-center justify-between bg-white px-4 sticky top-0 z-40 shadow-sm">
             <div className="flex items-center gap-3">
@@ -509,65 +466,9 @@ function DashboardLayoutContent({
             </div>
           </div>
         )}
-        <main className="flex-1 min-h-screen">{children}</main>
+        <main className="flex-1 min-h-0 h-full overflow-hidden">{children}</main>
 
-        {isNewsRoute && (
-          <>
-            {botOpen && (
-              <div
-                className="fixed bottom-24 right-6 z-50 rounded-2xl border border-gray-200 bg-white shadow-2xl overflow-hidden"
-                style={{
-                  width: `${botSize.width}px`,
-                  height: `${botSize.height}px`,
-                  maxWidth: "calc(100vw - 1.5rem)",
-                  maxHeight: "calc(100vh - 8rem)",
-                }}
-              >
-                <div className="absolute right-3 top-3 z-10">
-                  <button
-                    type="button"
-                    onClick={() => setBotOpen(false)}
-                    className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-500 hover:text-gray-700 hover:bg-gray-50"
-                    title="最小化"
-                  >
-                    <Minimize2 className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-                <NewsBot
-                  onClose={() => setBotOpen(false)}
-                  articleId={currentArticleId}
-                />
-                <div
-                  className="absolute bottom-0 left-0 h-4 w-4 cursor-nwse-resize"
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    botResizeStartRef.current = {
-                      x: e.clientX,
-                      y: e.clientY,
-                      width: botSize.width,
-                      height: botSize.height,
-                    };
-                    setIsBotResizing(true);
-                  }}
-                  title="拖拽调整聊天窗大小"
-                />
-              </div>
-            )}
-
-            <button
-              type="button"
-              onClick={() => setBotOpen((v) => !v)}
-              className="fixed bottom-6 right-6 z-50 inline-flex h-14 w-14 items-center justify-center rounded-full bg-[#1677ff] text-white shadow-xl hover:bg-[#0958d9] transition-colors"
-              title={
-                currentArticleId
-                  ? "唤起 AI 助手（当前文章问答）"
-                  : "唤起 AI 助手"
-              }
-            >
-              <MessageCircle className="h-6 w-6" />
-            </button>
-          </>
-        )}
+        {/* NewsBot is now rendered inline inside NewsHub for /news routes */}
       </SidebarInset>
     </>
   );

@@ -5,8 +5,7 @@ import { Redirect, Route, Switch } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import DashboardLayout from "./components/DashboardLayout";
 import { ThemeProvider } from "./contexts/ThemeContext";
-import News from "./pages/News";
-import NewsDetail from "./pages/NewsDetail";
+import NewsHub from "./pages/NewsHub";
 import Projects from "./pages/Projects";
 import PlaceholderPage from "./pages/PlaceholderPage";
 import SystemManagement from "./pages/SystemManagement";
@@ -27,17 +26,17 @@ function Router() {
         <Redirect to="/" />
       </Route>
 
-      {/* News routes - no layout wrapper needed (full screen) */}
+      {/* News routes: NewsHub renders AI assistant + news list/detail side by side */}
       <Route path="/news/:id">
-        {(params) => (
+        {() => (
           <DashboardLayout>
-            <NewsDetail />
+            <NewsHub />
           </DashboardLayout>
         )}
       </Route>
       <Route path="/news">
         <DashboardLayout>
-          <News />
+          <NewsHub />
         </DashboardLayout>
       </Route>
 

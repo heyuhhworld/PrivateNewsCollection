@@ -1,5 +1,15 @@
 import type { Express, Request, Response } from "express";
 import { eq } from "drizzle-orm";
+import {
+  normalizeNewsRegion,
+  normalizeNewsStrategy,
+  normalizePublishedAt,
+  normalizeUploaderUserId,
+  NEWS_REGION_VALUES,
+  NEWS_STRATEGY_VALUES,
+  sanitizeNewsSections,
+  sanitizeNewsTags,
+} from "./articleMetaNormalize";
 import { getDevBypassUser } from "./devAuth";
 import { ENV } from "./env";
 import { invokeLLM } from "./llm";
@@ -38,7 +48,12 @@ async function analyzeWebClipWithLlm(params: {
       {
         role: "system",
         content:
-          "用户从浏览器网页剪藏到内部资讯库。请根据正文片段生成结构化元数据（与手工上传 PDF 后同一套字段风格），事实严格来自文本；无法推断的字段用 null 或空数组。",
+          "用户从浏览器网页剪藏到内部资讯库。请根据正文片段生成结构化元数据（与手工上传 PDF 后同一套字段风格），事实严格来自文本；无法推断的字段用 null 或空数组。\n\n" +
+          "**重要**：strategy 只能是以下中文词之一，或与文本不符时填 null：" +
+          `${NEWS_STRATEGY_VALUES.join("、")}` +
+          "。region 只能是以下中文词之一，或 null：" +
+          `${NEWS_REGION_VALUES.join("、")}` +
+          "。禁止使用英文枚举值（如 Private Equity、North America 等），否则会导致入库失败。",
       },
       {
         role: "user",
@@ -187,25 +202,32 @@ export function registerExtensionImportRoutes(app: Express) {
         : [];
 
     try {
+      const strategy = normalizeNewsStrategy(meta.strategy);
+      const region = normalizeNewsRegion(meta.region);
+      const publishedAt = normalizePublishedAt(meta.publishedAt);
+      const tags = sanitizeNewsTags(meta.tags);
+      const sections = sanitizeNewsSections(meta.sections);
+      const eff = String(meta.effectivePeriodLabel ?? "").trim();
+
       await db.insert(newsArticles).values({
         source: "ChromeExtension",
         title: (meta.title as string) || title,
         summary: meta.summary as string,
         content: meta.content as string,
         keyInsights: keyInsights.length > 0 ? keyInsights : null,
-        sections: meta.sections as any,
+        sections,
         originalUrl: url,
         author: (meta.author as string | null) ?? null,
-        publishedAt: new Date((meta.publishedAt as string) || new Date().toISOString().slice(0, 10)),
-        strategy: meta.strategy as any,
-        region: meta.region as any,
-        tags: meta.tags as string[],
+        publishedAt,
+        strategy,
+        region,
+        tags,
         isRead: false,
         recordCategory,
         isHidden: false,
-        uploaderUserId: user.id,
+        uploaderUserId: normalizeUploaderUserId(user.id),
         fileUploadedAt: new Date(),
-        effectivePeriodLabel: meta.effectivePeriodLabel as string,
+        effectivePeriodLabel: eff || "未标注",
         extractedText: clipped,
         extractedLinePageMap: null,
       });
@@ -225,7 +247,21 @@ export function registerExtensionImportRoutes(app: Express) {
       });
     } catch (e: unknown) {
       console.error("[import-page]", e);
-      res.status(500).json({ error: e instanceof Error ? e.message : "入库失败" });
+      const raw = e instanceof Error ? e.message : String(e);
+      const lower = raw.toLowerCase();
+      if (
+        lower.includes("data truncated") ||
+        lower.includes("incorrect") ||
+        lower.includes("1265") ||
+        lower.includes("enum")
+      ) {
+        res.status(500).json({
+          error:
+            "保存失败：数据库字段与当前程序不一致（常见原因：未包含「浏览器插件」来源枚举）。请让管理员在本机项目根执行 pnpm run db:ensure-schema 后重启服务，再重试导入。",
+        });
+        return;
+      }
+      res.status(500).json({ error: raw || "入库失败" });
     }
   });
 }

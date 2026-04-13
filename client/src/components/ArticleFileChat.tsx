@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Streamdown } from "streamdown";
+import { getRehypePluginsWithOrigin } from "@/lib/streamdownPlugins";
 import { Bot, Loader2, Send, Sparkles } from "lucide-react";
 import { nanoid } from "nanoid";
 
@@ -107,7 +108,7 @@ export default function ArticleFileChat({
                 }`}
               >
                 {m.role === "assistant" ? (
-                  <Streamdown className="prose prose-sm max-w-none dark:prose-invert">
+                  <Streamdown className="prose prose-sm max-w-none dark:prose-invert" rehypePlugins={getRehypePluginsWithOrigin()}>
                     {m.content}
                   </Streamdown>
                 ) : (

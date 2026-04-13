@@ -4,20 +4,31 @@ import {
   getChatHistory,
   saveChatMessage,
   getNewsArticleById,
+  getNewsArticlesByIds,
   getUserReadingProfile,
   insertReadingEvent,
+  searchReadingImages,
+  listChatSessionsByUser,
+  renameChatSessionByUser,
+  deleteChatSessionByUser,
 } from "../db";
 import { invokeLLM } from "../_core/llm";
 import type { Message, Tool, ToolCall } from "../_core/llm";
 import { semanticSearchArticles } from "../_core/semanticSearch";
+import { getChromeExtensionUserGuideMarkdown } from "@shared/chromeExtensionUserGuide";
 import {
   appendCitedArticleLinks,
   buildArticleRefMap,
+  buildChromeExtensionAssistantBlock,
   buildNewsContextBlock,
   collectCitationsFromAnswer,
   GLOBAL_CHAT_SYSTEM_RULES,
+  guessChromeExtensionOrProductQuestion,
   resolveRelevantArticlesForChat,
 } from "../_core/chatShared";
+import { maybeBuildHotAnalyticsAnswer } from "../_core/hotViewAnalytics";
+import { maybeBuildMyArticlesAnswer } from "../_core/myArticlesQuery";
+import { isImageRelatedQuery, buildImageContextBlock } from "../_core/imageQueryHelper";
 import type { NewsArticle } from "../../drizzle/schema";
 
 const CHAT_AGENT_TOOLS: Tool[] = [
@@ -49,6 +60,22 @@ const CHAT_AGENT_TOOLS: Tool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "search_images",
+      description:
+        "搜索用户保存的图片（截图、剪藏图等）。按关键词匹配图片内容描述和标签。返回图片 URL 和内容描述，在回答中引用时使用 markdown 图片语法 ![描述](url)。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "搜索关键词" },
+          articleId: { type: "integer", description: "限定文章 ID（可选）" },
+        },
+        required: ["query"],
+      },
+    },
+  },
 ];
 
 function textFromAssistantContent(raw: unknown): string {
@@ -66,11 +93,65 @@ function textFromAssistantContent(raw: unknown): string {
   return "";
 }
 
+/** 模型偶发在 JSON 外包裹 markdown 代码块，直接 JSON.parse 会整段 mutation 失败 */
+function stripMarkdownJsonFence(s: string): string {
+  const t = s.trim();
+  const m = t.match(/^```(?:json)?\s*\r?\n?([\s\S]*?)\r?\n?```\s*$/i);
+  return m ? m[1].trim() : t;
+}
+
+function parseFocusedDocLlmJson(raw: unknown): {
+  answer: string;
+  refs: unknown[];
+} | null {
+  const text = textFromAssistantContent(raw).trim();
+  if (!text) return null;
+  const attempts = [text, stripMarkdownJsonFence(text)];
+  for (const chunk of attempts) {
+    const c = chunk.trim();
+    if (!c) continue;
+    try {
+      const j = JSON.parse(c) as {
+        answer?: unknown;
+        refs?: unknown;
+      };
+      if (j && typeof j.answer === "string" && j.answer.trim()) {
+        const refs = Array.isArray(j.refs) ? j.refs : [];
+        return { answer: j.answer.trim(), refs };
+      }
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
 function formatRefTable(refOrder: { id: number; title: string }[]): string {
   if (refOrder.length === 0) return "（暂无）";
   return refOrder
     .map((r, i) => `[文章${i + 1}] id=${r.id} | ${r.title}`)
     .join("\n");
+}
+
+function stripProcessPreamble(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const out: string[] = [];
+  let dropped = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i] ?? "";
+    const t = raw.trim();
+    if (
+      !dropped &&
+      /^(目前资讯库里|当前可明确看到|以下基于当前文档内容回答|我先|先说明|先总结|简要总结如下[:：]?)/.test(
+        t
+      )
+    ) {
+      dropped = true;
+      continue;
+    }
+    out.push(raw);
+  }
+  return out.join("\n").replace(/^\s+/, "").trimStart();
 }
 
 async function runAgentTool(
@@ -125,6 +206,28 @@ async function runAgentTool(
       body,
     });
   }
+  if (name === "search_images") {
+    const q = String(args.query ?? "").trim();
+    if (!q) return JSON.stringify({ error: "query 为空" });
+    const artId = args.articleId ? Math.floor(Number(args.articleId)) : undefined;
+    const imgs = await searchReadingImages(q, {
+      articleId: artId && Number.isFinite(artId) ? artId : undefined,
+      limit: 6,
+    });
+    if (imgs.length === 0) return JSON.stringify({ results: [], hint: "未找到匹配图片" });
+    return JSON.stringify({
+      results: imgs.map((img) => ({
+        id: img.id,
+        articleId: img.articleId,
+        url: `/uploads/news/${img.storageKey}`,
+        caption: img.caption,
+        description: img.analysisText,
+        tags: img.analysisTags,
+        page: img.sourcePage,
+      })),
+      hint: "在回答中使用 ![描述](url) 展示图片",
+    });
+  }
   return JSON.stringify({ error: "未知工具" });
 }
 
@@ -141,7 +244,8 @@ async function runGlobalAgentChat(
   message: string,
   historyMessages: { role: "user" | "assistant"; content: string }[],
   seedArticles: NewsArticle[],
-  readingHint = ""
+  readingHint = "",
+  siteOrigin = ""
 ): Promise<{ content: string; refOrder: { id: number; title: string }[] }> {
   const refOrder: { id: number; title: string }[] = [];
   for (const a of seedArticles) {
@@ -150,7 +254,10 @@ async function runGlobalAgentChat(
     }
   }
   const initialCtx = buildNewsContextBlock(seedArticles);
+  const extBlock = buildChromeExtensionAssistantBlock(siteOrigin);
   const systemText = `${GLOBAL_CHAT_SYSTEM_RULES}${readingHint}
+
+${extBlock}
 
 【初步语义检索结果】（务必优先使用；不足时再调用工具）
 ${initialCtx || "（无）"}
@@ -160,7 +267,8 @@ ${formatRefTable(refOrder)}
 
 可用工具：
 - search_articles：补充检索，新文章会追加到引用表并更新编号；
-- get_article_detail：按 id 拉取长正文。`;
+- get_article_detail：按 id 拉取长正文；
+- search_images：搜索已保存的图片/截图，按关键词匹配图片内容。找到后在回答中用 ![描述](url) 展示。`;
 
   const messages: Message[] = [
     { role: "system", content: systemText },
@@ -214,6 +322,37 @@ export const chatRouter = router({
       return getChatHistory(input.sessionId);
     }),
 
+  sessions: publicProcedure
+    .input(z.object({ userId: z.number().int() }))
+    .query(async ({ input }) => {
+      return listChatSessionsByUser(input.userId);
+    }),
+
+  renameSession: publicProcedure
+    .input(
+      z.object({
+        userId: z.number().int(),
+        sessionId: z.string().min(1).max(64),
+        title: z.string().min(1).max(60),
+      })
+    )
+    .mutation(async ({ input }) => {
+      const ok = await renameChatSessionByUser(input.userId, input.sessionId, input.title);
+      return { success: ok };
+    }),
+
+  deleteSession: publicProcedure
+    .input(
+      z.object({
+        userId: z.number().int(),
+        sessionId: z.string().min(1).max(64),
+      })
+    )
+    .mutation(async ({ input }) => {
+      const n = await deleteChatSessionByUser(input.userId, input.sessionId);
+      return { success: n > 0 };
+    }),
+
   send: publicProcedure
     .input(
       z.object({
@@ -221,17 +360,22 @@ export const chatRouter = router({
         message: z.string().min(1).max(2000),
         userId: z.number().optional(),
         articleId: z.number().int().optional(),
+        articleIds: z.array(z.number().int()).max(5).optional(),
         origin: z.string().optional(),
       })
     )
     .mutation(async ({ input }) => {
       const { sessionId, message, userId, origin, articleId } = input;
+      const linkedArticleIds = Array.from(new Set(input.articleIds ?? [])).filter(
+        (id) => Number.isFinite(id) && id > 0
+      );
+      const hotAnswer = await maybeBuildHotAnalyticsAnswer(message);
 
       if (userId) {
         await insertReadingEvent({
           userId,
           sessionId,
-          articleId: articleId ?? null,
+          articleId: articleId ?? linkedArticleIds[0] ?? null,
           recordCategory: null,
           eventType: "chat_ask",
           payload: { len: message.length },
@@ -244,6 +388,25 @@ export const chatRouter = router({
         role: "user",
         content: message,
       });
+
+      const quickAnswer =
+        hotAnswer ??
+        (articleId == null && linkedArticleIds.length === 0
+          ? await maybeBuildMyArticlesAnswer(message, userId ?? null)
+          : null);
+      if (quickAnswer) {
+        await saveChatMessage({
+          sessionId,
+          userId: userId ?? null,
+          role: "assistant",
+          content: quickAnswer,
+        });
+        return {
+          content: quickAnswer,
+          references: [],
+          citations: [],
+        };
+      }
 
       let focusedDocBlock = "";
       let focusedDocMeta: { id: number; title: string } | null = null;
@@ -268,9 +431,36 @@ ${raw || "（无文本）"}
         }
       }
 
-      const relevantArticles = articleId
-        ? []
-        : await resolveRelevantArticlesForChat(message);
+      if (articleId != null && !focusedDocMeta) {
+        const notFoundMsg =
+          "未找到该篇资讯或暂不可用（可能已下线）。请返回列表刷新后再试。";
+        await saveChatMessage({
+          sessionId,
+          userId: userId ?? null,
+          role: "assistant",
+          content: notFoundMsg,
+        });
+        return {
+          content: notFoundMsg,
+          citations: [],
+          references: [],
+        };
+      }
+
+      let relevantArticles: NewsArticle[] = [];
+      if (!articleId) {
+        if (linkedArticleIds.length > 0) {
+          const rows = (await getNewsArticlesByIds(linkedArticleIds)).filter(
+            (a) => !a.isHidden
+          );
+          const map = new Map(rows.map((r) => [r.id, r]));
+          relevantArticles = linkedArticleIds
+            .map((id) => map.get(id))
+            .filter((v): v is NewsArticle => Boolean(v));
+        } else {
+          relevantArticles = await resolveRelevantArticlesForChat(message);
+        }
+      }
 
       let articleRefMap = buildArticleRefMap(relevantArticles);
 
@@ -286,6 +476,21 @@ ${raw || "（无文本）"}
         | undefined;
 
       if (focusedDocMeta) {
+        if (guessChromeExtensionOrProductQuestion(message)) {
+          const siteOrigin = origin?.trim() ?? "";
+          const pluginGuide = getChromeExtensionUserGuideMarkdown(siteOrigin);
+          await saveChatMessage({
+            sessionId,
+            userId: userId ?? null,
+            role: "assistant",
+            content: pluginGuide,
+          });
+          return {
+            content: pluginGuide,
+            citations: [],
+            references: [],
+          };
+        }
         const doc = await getNewsArticleById(focusedDocMeta.id);
         const extracted = (doc?.extractedText ?? doc?.content ?? "").trim();
         const allLines = extracted.split(/\r?\n/).filter((l) => l.trim().length > 0);
@@ -310,87 +515,125 @@ ${raw || "（无文本）"}
           .join("\n");
 
         const readingHint = await buildReadingHintText(userId ?? null);
-        const focusedResp = await invokeLLM({
-          messages: [
-            {
-              role: "system",
-              content: `你是严谨的文档问答助手。必须仅根据给定文档文本回答，不得使用外部知识。若文档无依据，明确回答“当前文档未提供该信息”。${readingHint}`,
-            },
-            {
-              role: "user",
-              content: `当前问题：${message}
+        let focusedImageBlock = "";
+        if (isImageRelatedQuery(message)) {
+          const imgCtx = await buildImageContextBlock(message, {
+            articleId: focusedDocMeta.id,
+            userId: userId ?? undefined,
+            siteOrigin: origin?.trim() ?? "",
+          });
+          focusedImageBlock = imgCtx.block;
+        }
+        try {
+          const focusedResp = await invokeLLM({
+            messages: [
+              {
+                role: "system",
+                content: `你是严谨的文档问答助手。必须仅根据给定文档文本回答，不得使用外部知识。若文档无依据，明确回答“当前文档未提供该信息”。${readingHint}${focusedImageBlock}`,
+              },
+              {
+                role: "user",
+                content: `当前问题：${message}
 
 请基于以下文档行号文本回答。每行都有 [P页码|L行号] 标记。
 ---
 ${numbered || "（无可用文本）"}
 ---
 
-请输出 JSON：
-- answer: 中文回答，第一句必须是“以下基于当前文档内容回答。”
-- refs: 1-4 条引用，字段：
-  - page: 页码（整数，>=1）
-  - startLine: 起始行号（整数，>=1）
-  - endLine: 结束行号（整数，>=startLine）
-  - quote: 该行段的简短摘录（20-120 字）`,
-            },
-          ],
-          response_format: {
-            type: "json_schema",
-            json_schema: {
-              name: "focused_doc_answer",
-              strict: true,
-              schema: {
-                type: "object",
-                properties: {
-                  answer: { type: "string" },
-                  refs: {
-                    type: "array",
-                    minItems: 0,
-                    maxItems: 4,
-                    items: {
-                      type: "object",
-                      properties: {
-                        page: { type: "integer", minimum: 1 },
-                        startLine: { type: "integer", minimum: 1 },
-                        endLine: { type: "integer", minimum: 1 },
-                        quote: { type: "string" },
+请**只输出**一个 JSON 对象，不要 markdown 围栏或其它说明。字段：
+- answer: 中文专业回答，直接给结论，不要写“以下基于当前文档内容回答”等过程化前缀
+- refs: 0-4 条引用，每项含 page、startLine、endLine、quote（quote 为该行段摘录，20-120 字）`,
+              },
+            ],
+            response_format: {
+              type: "json_schema",
+              json_schema: {
+                name: "focused_doc_answer",
+                strict: false,
+                schema: {
+                  type: "object",
+                  properties: {
+                    answer: { type: "string" },
+                    refs: {
+                      type: "array",
+                      minItems: 0,
+                      maxItems: 4,
+                      items: {
+                        type: "object",
+                        properties: {
+                          page: { type: "integer", minimum: 1 },
+                          startLine: { type: "integer", minimum: 1 },
+                          endLine: { type: "integer", minimum: 1 },
+                          quote: { type: "string" },
+                        },
+                        required: ["page", "startLine", "endLine", "quote"],
+                        additionalProperties: false,
                       },
-                      required: ["page", "startLine", "endLine", "quote"],
-                      additionalProperties: false,
                     },
                   },
+                  required: ["answer", "refs"],
+                  additionalProperties: false,
                 },
-                required: ["answer", "refs"],
-                additionalProperties: false,
               },
             },
-          },
-        } as any);
+          } as any);
 
-        const focusedRaw = focusedResp.choices?.[0]?.message?.content;
-        const focusedJson =
-          typeof focusedRaw === "string" ? JSON.parse(focusedRaw) : focusedRaw;
-        assistantContent = String(focusedJson?.answer ?? assistantContent);
-        references = Array.isArray(focusedJson?.refs)
-          ? focusedJson.refs
-              .map((r: any) => ({
+          const rawContent = focusedResp.choices?.[0]?.message?.content;
+          const parsed = parseFocusedDocLlmJson(rawContent);
+          if (parsed) {
+            assistantContent = parsed.answer;
+            references = parsed.refs
+              .filter(
+                (r): r is Record<string, unknown> =>
+                  typeof r === "object" && r !== null && !Array.isArray(r)
+              )
+              .map((r) => ({
                 page: Math.max(1, Number(r.page) || 1),
                 startLine: Math.max(1, Number(r.startLine) || 1),
-                endLine: Math.max(1, Number(r.endLine) || Number(r.startLine) || 1),
+                endLine: Math.max(
+                  1,
+                  Number(r.endLine) || Number(r.startLine) || 1
+                ),
                 quote: String(r.quote ?? "").trim() || undefined,
               }))
-              .slice(0, 4)
-          : [];
+              .slice(0, 4);
+          } else {
+            const plain = textFromAssistantContent(rawContent).trim();
+            if (plain.length > 15 && !plain.startsWith("{")) {
+              assistantContent = plain;
+              references = [];
+            } else {
+              assistantContent =
+                "未能解析模型返回的结构化结果。请重试一次；若仍失败，请检查 LLM API 是否支持 json_schema 或网络是否稳定。";
+              references = [];
+            }
+          }
+        } catch (e) {
+          const hint = e instanceof Error ? e.message : String(e);
+          assistantContent = `文档问答调用失败：${hint.slice(0, 500)}`;
+          references = [];
+        }
       } else {
         if (relevantArticles.length === 0) {
-          assistantContent = "资讯库未提供与该问题直接相关的信息。";
+          const siteOrigin = origin?.trim() ?? "";
+          if (hotAnswer) {
+            assistantContent = hotAnswer;
+            articleRefMap = {};
+          } else if (guessChromeExtensionOrProductQuestion(message)) {
+            assistantContent = getChromeExtensionUserGuideMarkdown(siteOrigin);
+            articleRefMap = {};
+          } else {
+            assistantContent =
+              "未在资讯库中检索到与问题直接匹配的条目。若你问的是访问热度、PV/UV 或停留时长，请用「统计」「热度」「表格」等词重新提问，以便走行为分析回答。";
+          }
         } else {
           const readingHint = await buildReadingHintText(userId ?? null);
           const agentOut = await runGlobalAgentChat(
             message,
             historyMessages,
             relevantArticles,
-            readingHint
+            readingHint,
+            origin?.trim() ?? ""
           );
           assistantContent = agentOut.content;
           articleRefMap = agentOut.refOrder.reduce(
@@ -411,9 +654,7 @@ ${numbered || "（无可用文本）"}
         }
       }
 
-      if (focusedDocMeta && !assistantContent.includes("以下基于当前文档内容回答")) {
-        assistantContent = `以下基于当前文档内容回答。\n\n${assistantContent}`;
-      }
+      assistantContent = stripProcessPreamble(assistantContent);
 
       await saveChatMessage({
         sessionId,

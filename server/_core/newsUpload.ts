@@ -15,6 +15,14 @@ import {
   extractTextFromFile,
   normalizeExtension,
 } from "./extractDocument";
+import {
+  normalizeNewsRegion,
+  normalizeNewsStrategy,
+  normalizePublishedAt,
+  normalizeUploaderUserId,
+  sanitizeNewsSections,
+  sanitizeNewsTags,
+} from "./articleMetaNormalize";
 import { getDb } from "../db";
 import { newsArticles } from "../../drizzle/schema";
 
@@ -320,28 +328,35 @@ export function registerNewsUploadRoutes(app: Express) {
               }))
             : [];
 
+        const strategy = normalizeNewsStrategy(meta.strategy);
+        const region = normalizeNewsRegion(meta.region);
+        const publishedAt = normalizePublishedAt(meta.publishedAt);
+        const tags = sanitizeNewsTags(meta.tags);
+        const sections = sanitizeNewsSections(meta.sections);
+        const eff = String(meta.effectivePeriodLabel ?? "").trim();
+
         await db.insert(newsArticles).values({
           source: articleSource,
           title: meta.title as string,
           summary: meta.summary as string,
           content: meta.content as string,
           keyInsights: keyInsights.length > 0 ? keyInsights : null,
-          sections: meta.sections as any,
+          sections,
           originalUrl: syntheticUrl,
           author: (meta.author as string | null) ?? null,
-          publishedAt: new Date(meta.publishedAt as string),
-          strategy: meta.strategy as any,
-          region: meta.region as any,
-          tags: meta.tags as string[],
+          publishedAt,
+          strategy,
+          region,
+          tags,
           isRead: false,
           recordCategory: "report",
           isHidden: false,
-          uploaderUserId: user.id,
+          uploaderUserId: normalizeUploaderUserId(user.id),
           fileUploadedAt: new Date(),
           attachmentStorageKey: storageKey,
           attachmentMime: file.mimetype,
           attachmentOriginalName: file.originalname,
-          effectivePeriodLabel: meta.effectivePeriodLabel as string,
+          effectivePeriodLabel: eff || "未标注",
           extractedText: extracted,
           extractedLinePageMap,
         });

@@ -3,8 +3,10 @@ import {
   upsertEntity,
   linkEntityToArticle,
   upsertEntityRelation,
+  buildEntityMatchIndex,
 } from "../db";
 import type { NewsArticle } from "../../drizzle/schema";
+import { canonicalEntityDisplayName, entityMatchKey } from "./entityCanonical";
 
 interface ExtractedEntity {
   name: string;
@@ -55,6 +57,7 @@ export async function extractEntitiesFromArticle(
 规则：
 - 去重；同一实体仅出现一次
 - 人名尽量用全称
+- 机构/数据商使用通行英文拼写：PitchBook、Preqin、Morningstar 等，避免「Pitchbook」「pitch book」等变体
 - 仅抽取文中明确提及的关系
 - 若无可识别实体则返回空数组`,
         },
@@ -121,23 +124,45 @@ export async function extractAndStoreEntities(
   const { entities, relations } = await extractEntitiesFromArticle(article);
   if (entities.length === 0) return;
 
+  const matchIndex = await buildEntityMatchIndex();
   const nameToId = new Map<string, number>();
 
+  const rememberMention = (raw: string, id: number) => {
+    const t = raw.trim();
+    const d = canonicalEntityDisplayName(t);
+    nameToId.set(t, id);
+    nameToId.set(d, id);
+    nameToId.set(entityMatchKey(d), id);
+  };
+
+  const resolveMention = (mention: string): number | undefined => {
+    const t = mention.trim();
+    if (nameToId.has(t)) return nameToId.get(t);
+    const d = canonicalEntityDisplayName(t);
+    if (nameToId.has(d)) return nameToId.get(d);
+    const k = entityMatchKey(d);
+    if (nameToId.has(k)) return nameToId.get(k);
+    return matchIndex.get(k)?.id;
+  };
+
   for (const ent of entities) {
-    const id = await upsertEntity({
-      name: ent.name.trim(),
-      type: ent.type,
-      aliases: ent.aliases?.filter(Boolean) ?? null,
-    });
+    const id = await upsertEntity(
+      {
+        name: ent.name.trim(),
+        type: ent.type,
+        aliases: ent.aliases?.filter(Boolean) ?? null,
+      },
+      matchIndex
+    );
     if (id) {
-      nameToId.set(ent.name.trim(), id);
+      rememberMention(ent.name, id);
       await linkEntityToArticle(id, article.id);
     }
   }
 
   for (const rel of relations) {
-    const srcId = nameToId.get(rel.source.trim());
-    const tgtId = nameToId.get(rel.target.trim());
+    const srcId = resolveMention(rel.source);
+    const tgtId = resolveMention(rel.target);
     if (srcId && tgtId) {
       await upsertEntityRelation({
         sourceEntityId: srcId,

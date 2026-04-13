@@ -42,6 +42,10 @@ export const ENV = {
   embeddingOpenAiBaseUrl: process.env.EMBEDDING_OPENAI_BASE_URL?.trim() || "",
   /** Cron 表达式：定时生成并推送简报；默认工作日早 8:30 */
   briefingCron: process.env.BRIEFING_CRON?.trim() || "30 8 * * 1-5",
+  /** 知识图谱：按规范化名合并重复实体与去重边；默认每周日 03:00 */
+  kgMergeCron: process.env.KG_MERGE_CRON?.trim() || "0 3 * * 0",
+  /** 定时任务生成简报时追加到 system prompt（全员）；个人偏好见用户简报设置 */
+  briefingExtraInstruction: process.env.BRIEFING_EXTRA_INSTRUCTION?.trim() || "",
   /** SMTP 邮件 */
   smtpHost: process.env.SMTP_HOST?.trim() || "",
   smtpPort: parseInt(process.env.SMTP_PORT?.trim() || "465", 10),

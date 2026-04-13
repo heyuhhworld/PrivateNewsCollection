@@ -1,31 +1,67 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import {
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  useMemo,
+  type ReactNode,
+} from "react";
 import { useLocation } from "wouter";
+import { TRPCClientError } from "@trpc/client";
 import { trpc } from "@/lib/trpc";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  getChromeExtensionUserGuideMarkdown,
+  chromeExtensionZipUrl,
+} from "@shared/chromeExtensionUserGuide";
+
+
+import {
+  copyChromeExtensionsUrl,
+  tryOpenChromeExtensionsPage,
+} from "@/lib/chromeExtensions";
 import { Streamdown } from "streamdown";
+import { getRehypePluginsWithOrigin } from "@/lib/streamdownPlugins";
 import {
   Bot,
+  Link2,
   Loader2,
   Send,
+  X,
   Sparkles,
   User,
-  X,
-  Upload,
-  Link2,
-  ListTodo,
   PlusCircle,
-  Flame,
+  Puzzle,
+  Maximize2,
+  Minimize2,
+  Shrink,
+  History,
+  ThumbsUp,
+  ThumbsDown,
+  Copy,
+  RefreshCw,
+  Trash2,
+  Pencil,
 } from "lucide-react";
 import { nanoid } from "nanoid";
+import { toast } from "sonner";
 
 const CHAT_SESSION_KEY = "ipms_research_chat_session_id";
+const ARTICLE_CHAT_SESSION_KEY_PREFIX = "ipms_article_chat_session_id:";
 
 type CitationItem = { refKey: string; articleId: number; title: string };
 
@@ -42,16 +78,12 @@ type Message = {
   citations?: CitationItem[];
 };
 
-type ImportTask = {
-  id: string;
-  kind: "file" | "url";
-  label: string;
-  status: "queued" | "running" | "done" | "failed";
-  detail?: string;
-};
-
 function stripCitationFooter(content: string): string {
   return content.replace(/\n\n---\s*\n\*\*相关资讯链接：\*\*[\s\S]*$/m, "").trimEnd();
+}
+
+function stripSessionTitlePrefix(content: string): string {
+  return content.replace(/^\[会话名:.+?\]\s*/, "");
 }
 
 /** 从历史消息正文尾部解析引用（无 citations 元数据时） */
@@ -64,14 +96,32 @@ function parseCitationsFromFooter(content: string): CitationItem[] {
   let m: RegExpExecArray | null;
   let n = 1;
   while ((m = re.exec(tail)) !== null) {
+    const aid = Number(m[2]);
     out.push({
       refKey: `文章${n}`,
-      articleId: Number(m[2]),
+      articleId: aid,
       title: m[1],
     });
     n++;
   }
   return out;
+}
+
+/** Build map: "文章1" → articleId, for rewriting body text */
+function buildRefKeyToIdMap(cites: CitationItem[]): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const c of cites) map.set(c.refKey, c.articleId);
+  return map;
+}
+
+/** Replace [文章N] in text with [#articleId] */
+function rewriteCitationKeysInBody(body: string, cites: CitationItem[]): string {
+  if (cites.length === 0) return body;
+  const map = buildRefKeyToIdMap(cites);
+  return body.replace(/\[文章(\d+)\]/g, (_match, n) => {
+    const aid = map.get(`文章${n}`);
+    return aid ? `[#${aid}]` : _match;
+  });
 }
 
 function mergeCitationsForMessage(msg: Message): CitationItem[] {
@@ -82,13 +132,32 @@ function mergeCitationsForMessage(msg: Message): CitationItem[] {
 
 function AssistantBody({
   content,
+  onNavigate,
+  citations,
 }: {
   content: string;
+  onNavigate?: (path: string) => void;
+  citations?: CitationItem[];
 }) {
-  const display = stripCitationFooter(content);
+  const display = rewriteCitationKeysInBody(stripCitationFooter(content), citations ?? []);
+  const handleClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const target = (e.target as HTMLElement).closest("a");
+      if (!target) return;
+      const href = target.getAttribute("href");
+      if (href && /^\/news\/\d+$/.test(href)) {
+        e.preventDefault();
+        onNavigate?.(`${href}?entry=chat`);
+      }
+    },
+    [onNavigate]
+  );
   return (
-    <div className="prose prose-sm max-w-none text-gray-700 [&_a]:inline-flex [&_a]:items-center [&_a]:align-middle [&_a]:mx-0.5 [&_a]:text-[#1677ff]">
-      <Streamdown>{display}</Streamdown>
+    <div
+      className="prose prose-sm max-w-none text-gray-700 [&_a]:inline-flex [&_a]:items-center [&_a]:align-middle [&_a]:mx-0.5 [&_a]:text-[#1677ff] [&_a]:cursor-pointer"
+      onClick={handleClick}
+    >
+      <Streamdown rehypePlugins={getRehypePluginsWithOrigin()}>{display}</Streamdown>
     </div>
   );
 }
@@ -100,11 +169,36 @@ const SUGGESTED_PROMPTS = [
   "Preqin 和 Pitchbook 最新报道了什么？",
   "有哪些大型基金正在募资？",
   "中国市场近期有什么投资动向？",
+  "Chrome 浏览器插件怎么下载和安装？有什么作用？",
 ];
 
 interface NewsBotProps {
-  onClose: () => void;
   articleId?: number;
+  openedArticleId?: number;
+  chatFullscreen?: boolean;
+  onToggleChatFullscreen?: () => void;
+  onMinimizeChat?: () => void;
+  onRequestPickArticle?: (
+    currentIds: number[],
+    onConfirm: (ids: number[]) => void
+  ) => void;
+}
+
+function HeaderIconTooltip({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{children}</TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={6} className="max-w-[16rem]">
+        {label}
+      </TooltipContent>
+    </Tooltip>
+  );
 }
 
 function getOrCreateChatSessionId(): string {
@@ -120,67 +214,167 @@ function getOrCreateChatSessionId(): string {
   }
 }
 
-function guessImportSource(url: string): "Preqin" | "Pitchbook" {
-  const u = url.toLowerCase();
-  if (u.includes("preqin.com")) return "Preqin";
-  return "Pitchbook";
+function getArticleChatSessionKey(articleId: number): string {
+  return `${ARTICLE_CHAT_SESSION_KEY_PREFIX}${articleId}`;
 }
 
-function looksLikeUrl(text: string): boolean {
-  const t = text.trim();
-  return /^https?:\/\//i.test(t) || /^www\./i.test(t);
+function getStoredSessionId(key: string): string | null {
+  try {
+    const v = localStorage.getItem(key)?.trim();
+    return v ? v : null;
+  } catch {
+    return null;
+  }
 }
 
-export default function NewsBot({ onClose, articleId }: NewsBotProps) {
+function setStoredSessionId(key: string, sessionId: string): void {
+  try {
+    localStorage.setItem(key, sessionId);
+  } catch {
+    /* ignore */
+  }
+}
+
+export default function NewsBot({
+  articleId,
+  openedArticleId,
+  chatFullscreen,
+  onToggleChatFullscreen,
+  onMinimizeChat,
+  onRequestPickArticle,
+}: NewsBotProps) {
   const [, setLocation] = useLocation();
-  const [sessionId, setSessionId] = useState(() => getOrCreateChatSessionId());
+  const [sessionId, setSessionId] = useState(() => nanoid());
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [importOpen, setImportOpen] = useState(false);
-  const [importUrlText, setImportUrlText] = useState("");
-  const [importTasks, setImportTasks] = useState<ImportTask[]>([]);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [linkedArticleIds, setLinkedArticleIds] = useState<number[]>([]);
+
+
+
+
+  const [chromeExtGuideOpen, setChromeExtGuideOpen] = useState(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   /** 避免在会话中途被 history 查询刷新覆盖本地消息 */
   const lastHistorySyncSession = useRef<string | null>(null);
+  /** 详情页优先尝试恢复旧会话；若该会话无历史，则仅重建一次空会话 */
+  const articleSessionLoadedFromStorage = useRef(false);
 
   const utils = trpc.useUtils();
   const { data: me } = trpc.auth.me.useQuery();
-  const [readingChipsDismissed, setReadingChipsDismissed] = useState(() => {
-    try {
-      return localStorage.getItem("ipms_reading_chips_hidden") === "1";
-    } catch {
-      return false;
-    }
-  });
-  const { data: profileSnippet } = trpc.reading.profileSnippet.useQuery(undefined, {
-    enabled: articleId == null && !!me?.id && !readingChipsDismissed,
-    staleTime: 120_000,
-  });
-  const sendMutation = trpc.chat.send.useMutation();
-  const importByUrlMutation = trpc.news.importByUrl.useMutation();
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+  const [renameInput, setRenameInput] = useState("");
+  const [feedbackMap, setFeedbackMap] = useState<Record<string, "like" | "dislike">>({});
 
+
+
+  const sendMutation = trpc.chat.send.useMutation();
+  const { data: sessionList } = trpc.chat.sessions.useQuery(
+    { userId: me?.id ?? 0 },
+    { enabled: Boolean(me?.id), staleTime: 15_000 }
+  );
+  const renameSessionMutation = trpc.chat.renameSession.useMutation({
+    onSuccess: async () => {
+      if (!me?.id) return;
+      await utils.chat.sessions.invalidate({ userId: me.id });
+      toast.success("会话已重命名");
+      setRenamingSessionId(null);
+      setRenameInput("");
+    },
+  });
+  const deleteSessionMutation = trpc.chat.deleteSession.useMutation({
+    onSuccess: async (_v, vars) => {
+      if (me?.id) await utils.chat.sessions.invalidate({ userId: me.id });
+      toast.success("会话已删除");
+      if (vars.sessionId === sessionId) {
+        startNewChat();
+      }
+    },
+  });
+  const { data: linkedArticlesMeta } = trpc.briefing.citationMeta.useQuery(
+    { ids: linkedArticleIds },
+    { enabled: linkedArticleIds.length > 0 }
+  );
+
+
+  const setBriefingPrefsMutation = trpc.briefing.setMyPrefs.useMutation({
+    onSuccess: () => {
+      void utils.briefing.myPrefs.invalidate();
+    },
+  });
+
+  const isInlineMode = !onMinimizeChat && !onToggleChatFullscreen;
+  const shouldLoadHistory = Boolean(sessionId) && (isInlineMode || Boolean(chatFullscreen) || articleId != null);
   const { data: historyRows, isSuccess: historyReady } = trpc.chat.history.useQuery(
     { sessionId },
-    { enabled: !!sessionId, staleTime: 30_000 }
+    { enabled: shouldLoadHistory, staleTime: 30_000 }
   );
 
   useEffect(() => {
-    if (!historyReady || !historyRows) return;
+    // 详情页：按文章/报告绑定独立会话，自动恢复最近一次对话
+    if (articleId != null) {
+      const key = getArticleChatSessionKey(articleId);
+      const restored = getStoredSessionId(key);
+      if (restored) {
+        articleSessionLoadedFromStorage.current = true;
+        setSessionId(restored);
+      } else {
+        articleSessionLoadedFromStorage.current = false;
+        const sid = nanoid();
+        setStoredSessionId(key, sid);
+        setSessionId(sid);
+      }
+      lastHistorySyncSession.current = null;
+      setMessages([]);
+      return;
+    }
+
+    articleSessionLoadedFromStorage.current = false;
+    if (isInlineMode || chatFullscreen) {
+      const sid = getOrCreateChatSessionId();
+      setSessionId(sid);
+    } else {
+      setSessionId(nanoid());
+    }
+    lastHistorySyncSession.current = null;
+    setMessages([]);
+  }, [articleId, chatFullscreen, isInlineMode]);
+
+  useEffect(() => {
+    if (openedArticleId == null || articleId != null) return;
+    setLinkedArticleIds((prev) =>
+      prev.includes(openedArticleId) ? prev : [openedArticleId, ...prev].slice(0, 5)
+    );
+  }, [openedArticleId, articleId]);
+
+  useEffect(() => {
+    if (!shouldLoadHistory || !historyReady || !historyRows) return;
+    if (articleId != null && historyRows.length === 0 && articleSessionLoadedFromStorage.current) {
+      // 旧会话已不存在/无记录：自动切到一个全新的空会话
+      const sid = nanoid();
+      setStoredSessionId(getArticleChatSessionKey(articleId), sid);
+      setSessionId(sid);
+      articleSessionLoadedFromStorage.current = false;
+      lastHistorySyncSession.current = null;
+      setMessages([]);
+      return;
+    }
     if (lastHistorySyncSession.current === sessionId) return;
+    articleSessionLoadedFromStorage.current = false;
     lastHistorySyncSession.current = sessionId;
     setMessages(
       historyRows.map((row) => ({
         id: `db-${row.id}`,
         role: row.role as "user" | "assistant",
-        content: row.content,
+        content:
+          row.role === "user" ? stripSessionTitlePrefix(row.content) : row.content,
         citations:
           row.role === "assistant" ? parseCitationsFromFooter(row.content) : undefined,
       }))
     );
-  }, [historyReady, historyRows, sessionId]);
+  }, [articleId, historyReady, historyRows, sessionId, shouldLoadHistory]);
 
   const scrollToBottom = () => {
     const viewport = scrollAreaRef.current?.querySelector(
@@ -199,186 +393,19 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
 
   const startNewChat = useCallback(() => {
     const next = nanoid();
-    try {
-      localStorage.setItem(CHAT_SESSION_KEY, next);
-    } catch {
-      /* ignore */
+    if (articleId != null) {
+      setStoredSessionId(getArticleChatSessionKey(articleId), next);
+      articleSessionLoadedFromStorage.current = false;
+    } else if (isInlineMode || chatFullscreen) {
+      setStoredSessionId(CHAT_SESSION_KEY, next);
     }
     setSessionId(next);
+    lastHistorySyncSession.current = null;
     setMessages([]);
-  }, []);
+  }, [articleId, chatFullscreen, isInlineMode]);
 
-  const appendImportTask = useCallback((task: ImportTask) => {
-    setImportTasks((prev) => [...prev, task]);
-  }, []);
 
-  const patchImportTask = useCallback((id: string, patch: Partial<ImportTask>) => {
-    setImportTasks((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, ...patch } : t))
-    );
-  }, []);
 
-  const runFileImport = useCallback(
-    async (file: File) => {
-      const tid = nanoid();
-      appendImportTask({
-        id: tid,
-        kind: "file",
-        label: file.name,
-        status: "running",
-      });
-      const fd = new FormData();
-      fd.append("file", file);
-      try {
-        const res = await fetch("/api/news/upload-document", {
-          method: "POST",
-          body: fd,
-          credentials: "include",
-        });
-        const json = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          patchImportTask(tid, {
-            status: "failed",
-            detail: (json as { error?: string }).error ?? `HTTP ${res.status}`,
-          });
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: nanoid(),
-              role: "assistant",
-              content: `文件导入失败：${(json as { error?: string }).error ?? res.statusText}`,
-            },
-          ]);
-          return;
-        }
-        const ok = json as { success?: boolean; articleId?: number; title?: string };
-        patchImportTask(tid, {
-          status: "done",
-          detail: ok.title ? `已入库 #${ok.articleId}` : "已完成",
-        });
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: nanoid(),
-            role: "assistant",
-            content: `文件导入成功。${ok.title ? `已添加报告「${ok.title}」。` : ""}`,
-            citations:
-              ok.articleId && ok.title
-                ? [{ refKey: "文章1", articleId: ok.articleId, title: ok.title }]
-                : undefined,
-          },
-        ]);
-      } catch (e) {
-        patchImportTask(tid, {
-          status: "failed",
-          detail: e instanceof Error ? e.message : "网络错误",
-        });
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: nanoid(),
-            role: "assistant",
-            content: "文件导入失败，请检查网络或登录状态后重试。",
-          },
-        ]);
-      }
-    },
-    [appendImportTask, patchImportTask]
-  );
-
-  const runUrlImport = useCallback(
-    async (raw: string) => {
-      let url = raw.trim();
-      if (/^www\./i.test(url)) url = `https://${url}`;
-      const tid = nanoid();
-      appendImportTask({
-        id: tid,
-        kind: "url",
-        label: url,
-        status: "running",
-      });
-      try {
-        const source = guessImportSource(url);
-        const out = await importByUrlMutation.mutateAsync({
-          urls: [url],
-          source,
-        });
-        const first = out.results[0];
-        if (first?.status === "success") {
-          patchImportTask(tid, { status: "done", detail: first.title });
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: nanoid(),
-              role: "assistant",
-              content: `链接导入成功：${first.title ?? url}。`,
-            },
-          ]);
-        } else if (first?.status === "duplicate") {
-          patchImportTask(tid, { status: "done", detail: "已存在" });
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: nanoid(),
-              role: "assistant",
-              content: `该链接对应内容已在库中${first.title ? `（${first.title}）` : ""}，未重复导入。`,
-            },
-          ]);
-        } else {
-          patchImportTask(tid, {
-            status: "failed",
-            detail: first?.error ?? "导入失败",
-          });
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: nanoid(),
-              role: "assistant",
-              content: `链接导入失败：${first?.error ?? "未知错误"}`,
-            },
-          ]);
-        }
-      } catch (e) {
-        patchImportTask(tid, {
-          status: "failed",
-          detail: e instanceof Error ? e.message : "请求失败",
-        });
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: nanoid(),
-            role: "assistant",
-            content: "链接导入失败，请稍后重试。",
-          },
-        ]);
-      }
-    },
-    [appendImportTask, importByUrlMutation, patchImportTask]
-  );
-
-  const handleSmartImportSubmit = useCallback(() => {
-    const text = importUrlText.trim();
-    if (looksLikeUrl(text)) {
-      setImportOpen(false);
-      void runUrlImport(text);
-      setImportUrlText("");
-      return;
-    }
-    if (fileInputRef.current?.files?.length) {
-      const f = fileInputRef.current.files[0];
-      void runFileImport(f);
-      fileInputRef.current.value = "";
-      return;
-    }
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: nanoid(),
-        role: "assistant",
-        content: "请粘贴以 http(s):// 开头的链接，或点击下方选择 PDF / Word 文件。",
-      },
-    ]);
-  }, [importUrlText, runUrlImport, runFileImport]);
 
   const handleSend = async (text?: string) => {
     const content = (text ?? input).trim();
@@ -392,11 +419,137 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
     let streamAssistantId: string | null = null;
 
     try {
+      if (articleId == null && /^\s*设置简报内容[:：]/.test(content)) {
+        if (!me?.id) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: "请先登录后再保存简报设置。", id: nanoid() },
+          ]);
+          return;
+        }
+        const full = content.replace(/^\s*设置简报内容[:：]\s*/, "").trim();
+        if (!full) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: "请在「设置简报内容：」后附上完整提示词内容。",
+              id: nanoid(),
+            },
+          ]);
+          return;
+        }
+        await setBriefingPrefsMutation.mutateAsync({
+          briefingSystemPromptCustom: full,
+          instruction: null,
+          introCompleted: true,
+        });
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "已按你提供的内容更新简报提示。", id: nanoid() },
+        ]);
+        return;
+      }
+
+      if (articleId == null && /^\s*【简报偏好】/.test(content)) {
+        if (!me?.id) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: "请先登录后再保存简报写作偏好。",
+              id: nanoid(),
+            },
+          ]);
+          return;
+        }
+        const instr = content.replace(/^\s*【简报偏好】\s*/, "").trim();
+        await setBriefingPrefsMutation.mutateAsync({
+          instruction: instr || null,
+          briefingSystemPromptCustom: null,
+          introCompleted: true,
+        });
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content:
+              "已保存你的「追加说明」：管理员下次在「AI 每日简报」点击「重新生成」时，会把它合并进系统默认模板。若需整条替换系统提示，请发送以「【简报完整提示】」开头的消息。",
+            id: nanoid(),
+          },
+        ]);
+        setAwaitingBriefingCustomizeConfirm(false);
+        setAwaitingBriefingPromptInput(false);
+        return;
+      }
+
+      if (articleId == null && /^\s*【简报完整提示】/.test(content)) {
+        if (!me?.id) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: "请先登录后再保存简报系统提示。",
+              id: nanoid(),
+            },
+          ]);
+          return;
+        }
+        const full = content.replace(/^\s*【简报完整提示】\s*/, "").trim();
+        if (!full) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: "请在「【简报完整提示】」同一消息里附上完整的 system 提示内容（可多行）。",
+              id: nanoid(),
+            },
+          ]);
+          return;
+        }
+        await setBriefingPrefsMutation.mutateAsync({
+          briefingSystemPromptCustom: full,
+          instruction: null,
+          introCompleted: true,
+        });
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content:
+              "已保存你的「完整 System Prompt」：将覆盖默认模板，仅在管理员重新生成每日简报时生效。若要改回默认并只用简短追加说明，可再发「【简报偏好】…」或在简报页点「恢复系统预设」。",
+            id: nanoid(),
+          },
+        ]);
+        setAwaitingBriefingCustomizeConfirm(false);
+        setAwaitingBriefingPromptInput(false);
+        return;
+      }
+
       if (articleId != null) {
         const result = await sendMutation.mutateAsync({
           sessionId,
           message: content,
           articleId,
+          userId: me?.id,
+          origin: window.location.origin,
+        });
+        const assistantMsg: Message = {
+          role: "assistant",
+          content: result.content,
+          id: nanoid(),
+          references: result.references,
+          citations: result.citations,
+        };
+        setMessages((prev) => [...prev, assistantMsg]);
+        return;
+      }
+
+      if (linkedArticleIds.length > 0) {
+        const result = await sendMutation.mutateAsync({
+          sessionId,
+          message: content,
+          articleIds: linkedArticleIds,
           userId: me?.id,
           origin: window.location.origin,
         });
@@ -505,9 +658,18 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
 
       await utils.chat.history.invalidate({ sessionId }).catch(() => {});
     } catch (err) {
+      const detail =
+        err instanceof TRPCClientError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "未知错误";
       const errorMsg: Message = {
         role: "assistant",
-        content: "抱歉，请求失败，请稍后重试。",
+        content:
+          detail && detail !== "Failed to fetch"
+            ? `抱歉，请求失败：${detail}`
+            : "抱歉，网络异常（Failed to fetch）。请确认本页地址与终端 dev 端口一致，或稍后重试。",
         id: nanoid(),
       };
       setMessages((prev) => {
@@ -535,176 +697,201 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
     }
   };
 
-  const quickFilters = useMemo(
-    () => [
-      {
-        label: "今日资讯",
-        onClick: () => {
-          window.dispatchEvent(
-            new CustomEvent("ipms-research-preset", { detail: { preset: "today" } })
-          );
-          setLocation("/news?preset=today");
-        },
-      },
-      {
-        label: "本周热度 Top3",
-        onClick: () => {
-          window.dispatchEvent(
-            new CustomEvent("ipms-research-preset", { detail: { preset: "weekTop3" } })
-          );
-          setLocation("/news?preset=weekTop3");
-        },
-      },
-    ],
-    [setLocation]
+  const handleCopy = useCallback(async (content: string) => {
+    try {
+      await navigator.clipboard.writeText(stripCitationFooter(content));
+      toast.success("已复制");
+    } catch {
+      toast.error("复制失败");
+    }
+  }, []);
+
+  const handleRegenerate = useCallback(
+    (assistantMsgId: string) => {
+      const idx = messages.findIndex((m) => m.id === assistantMsgId);
+      if (idx <= 0) return;
+      const prevUser = [...messages.slice(0, idx)]
+        .reverse()
+        .find((m) => m.role === "user");
+      if (!prevUser) return;
+      void handleSend(prevUser.content);
+    },
+    [messages]
   );
 
+  const openRename = useCallback((sid: string, title: string) => {
+    setRenamingSessionId(sid);
+    setRenameInput(title);
+  }, []);
+
+
+
+
   return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2.5 border-b border-gray-100 bg-white shrink-0 gap-2">
-        <div className="flex items-center gap-2 min-w-0">
+    <div className="flex flex-col h-full min-h-0 flex-1">
+      {/* Header：标题与所有窗口操作同一行，避免与外层绝对定位叠压 */}
+      <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-gray-100 bg-white shrink-0">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
           <div className="w-7 h-7 rounded-lg bg-[#1677ff] flex items-center justify-center shrink-0">
             <Bot className="h-4 w-4 text-white" />
           </div>
           <div className="min-w-0">
-            <p className="text-sm font-semibold text-gray-800 truncate">AI 资讯助手</p>
-            <p className="text-[11px] text-gray-400 truncate">
+            <p className="text-sm font-semibold text-gray-800 truncate leading-tight">
+              AI 资讯助手
+            </p>
+            <p className="text-[11px] text-gray-400 truncate leading-tight mt-0.5">
               {articleId
-                ? "本文问答（默认严格基于当前文档）"
-                : "基于资讯库 · 可导入链接或文件"}
+                ? "本文问答 · 严格基于当前文档"
+                : linkedArticleIds.length > 0
+                  ? `已关联 ${linkedArticleIds.length} 篇文章，优先基于关联内容回答`
+                  : "基于资讯库问答"}
             </p>
           </div>
         </div>
         <div className="flex items-center gap-1 shrink-0">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 px-2 text-xs text-gray-600"
-            onClick={startNewChat}
-            title="开启新会话（当前会话仍保留在服务端）"
-          >
-            <PlusCircle className="h-3.5 w-3.5 mr-1" />
-            新对话
-          </Button>
-          <Popover open={importOpen} onOpenChange={setImportOpen}>
-            <PopoverTrigger asChild>
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-7 px-2 text-xs border-[#1677ff]/30 text-[#1677ff]"
-                title="导入链接或文件"
+          <HeaderIconTooltip label="查看浏览器插件安装说明，并下载插件 ZIP 压缩包">
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="h-8 w-8 shrink-0 border-violet-200 text-violet-700 hover:bg-violet-50"
+              onClick={() => setChromeExtGuideOpen(true)}
+            >
+              <Puzzle className="h-4 w-4" />
+            </Button>
+          </HeaderIconTooltip>
+          <HeaderIconTooltip label="开启新对话；之前的会话仍保存在服务器，可从历史恢复">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0 text-gray-600"
+              onClick={startNewChat}
+            >
+              <PlusCircle className="h-4 w-4" />
+            </Button>
+          </HeaderIconTooltip>
+          <HeaderIconTooltip label="历史会话：查看、重命名、删除并继续问答">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0 text-gray-600"
+              onClick={() => setHistoryOpen(true)}
+              disabled={!me?.id}
+            >
+              <History className="h-4 w-4" />
+            </Button>
+          </HeaderIconTooltip>
+          {onToggleChatFullscreen && onMinimizeChat && (
+            <>
+              <HeaderIconTooltip
+                label={
+                  chatFullscreen
+                    ? "退出全屏，恢复为可拖拽调整大小的浮窗"
+                    : "全屏铺满当前页面（仍在本页内，非浏览器原生全屏）"
+                }
               >
-                <Upload className="h-3.5 w-3.5 mr-1" />
-                导入
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-80 p-3" align="end">
-              <p className="text-xs font-medium text-gray-700 mb-2">智能导入</p>
-              <p className="text-[11px] text-gray-500 mb-2">
-                粘贴 Preqin / Pitchbook 文章链接，或选择 PDF / Word；导入进行中仍可正常提问。
-              </p>
-              <div className="flex gap-1.5 mb-2">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                  className="hidden"
-                  onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    if (f) {
-                      setImportOpen(false);
-                      void runFileImport(f);
-                    }
-                    e.target.value = "";
-                  }}
-                />
-                <Button
+                <button
                   type="button"
-                  variant="secondary"
-                  size="sm"
-                  className="h-8 text-xs flex-1"
-                  onClick={() => fileInputRef.current?.click()}
+                  onClick={onToggleChatFullscreen}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-500 hover:text-gray-700 hover:bg-gray-50 shrink-0"
                 >
-                  <Upload className="h-3 w-3 mr-1" />
-                  选择文件
-                </Button>
-              </div>
-              <div className="flex gap-1.5 items-center">
-                <Link2 className="h-3.5 w-3.5 text-gray-400 shrink-0" />
-                <input
-                  className="flex-1 h-8 text-xs border rounded-md px-2 border-gray-200"
-                  placeholder="https://… 文章链接"
-                  value={importUrlText}
-                  onChange={(e) => setImportUrlText(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && handleSmartImportSubmit()}
-                />
-              </div>
-              <Button
-                type="button"
-                size="sm"
-                className="w-full mt-2 h-8 text-xs bg-[#1677ff]"
-                onClick={handleSmartImportSubmit}
-              >
-                提交链接
-              </Button>
-            </PopoverContent>
-          </Popover>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={onClose}
-            className="h-7 w-7 text-gray-400 hover:text-gray-600"
-          >
-            <X className="h-4 w-4" />
-          </Button>
+                  {chatFullscreen ? (
+                    <Shrink className="h-4 w-4" />
+                  ) : (
+                    <Maximize2 className="h-4 w-4" />
+                  )}
+                </button>
+              </HeaderIconTooltip>
+              <HeaderIconTooltip label="收起聊天窗（会话保留，可再次点击右下角按钮打开）">
+                <button
+                  type="button"
+                  onClick={onMinimizeChat}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-500 hover:text-gray-700 hover:bg-gray-50 shrink-0"
+                >
+                  <Minimize2 className="h-4 w-4" />
+                </button>
+              </HeaderIconTooltip>
+            </>
+          )}
         </div>
       </div>
-
-      {importTasks.length > 0 && (
-        <div className="px-3 py-2 border-b border-gray-100 bg-gray-50/90 shrink-0 max-h-28 overflow-y-auto">
-          <div className="flex items-center gap-1 text-[11px] font-medium text-gray-600 mb-1.5">
-            <ListTodo className="h-3 w-3" />
-            导入任务
-          </div>
-          <ul className="space-y-1">
-            {importTasks.slice(-6).map((t) => (
-              <li
-                key={t.id}
-                className="text-[11px] text-gray-600 flex items-start gap-1.5 justify-between"
-              >
-                <span className="truncate flex-1" title={t.label}>
-                  {t.kind === "url" ? "链接" : "文件"} · {t.label}
-                </span>
-                <span
-                  className={
-                    t.status === "done"
-                      ? "text-emerald-600 shrink-0"
-                      : t.status === "failed"
-                        ? "text-red-600 shrink-0"
-                        : "text-[#1677ff] shrink-0"
-                  }
+      {articleId == null && (
+        <div className="px-3 py-2 border-b border-gray-100 bg-gray-50/70 space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-[11px] text-gray-500 flex items-center gap-1">
+              <Link2 className="h-3 w-3" />
+              关联文章（问答优先使用）
+              {linkedArticleIds.length > 0 && (
+                <span className="ml-1 text-[#1677ff] font-medium">{linkedArticleIds.length}/5</span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {linkedArticleIds.length > 0 && (
+                <button
+                  type="button"
+                  className="text-[11px] text-gray-400 hover:text-red-500 hover:underline"
+                  onClick={() => setLinkedArticleIds([])}
                 >
-                  {t.status === "running"
-                    ? "进行中"
-                    : t.status === "done"
-                      ? "完成"
-                      : t.status === "failed"
-                        ? "失败"
-                        : "排队"}
-                  {t.detail ? ` · ${t.detail}` : ""}
-                </span>
-              </li>
-            ))}
-          </ul>
+                  清空
+                </button>
+              )}
+              <button
+                type="button"
+                className="text-[11px] text-[#1677ff] hover:underline"
+                onClick={() => {
+                  if (onRequestPickArticle) {
+                    onRequestPickArticle(linkedArticleIds, (ids) => {
+                      setLinkedArticleIds(ids);
+                    });
+                  }
+                }}
+              >
+                {linkedArticleIds.length > 0 ? "修改" : "添加"}
+              </button>
+            </div>
+          </div>
+          {linkedArticleIds.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {linkedArticleIds.map((id) => {
+                const title =
+                  linkedArticlesMeta?.find((m) => m.id === id)?.title ?? `文章 #${id}`;
+                return (
+                  <span
+                    key={id}
+                    className="inline-flex items-center gap-1 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700 max-w-full"
+                  >
+                    <button
+                      type="button"
+                      className="truncate max-w-[180px] hover:underline"
+                      title={title}
+                      onClick={() => setLocation(`/news/${id}?entry=chat`)}
+                    >
+                      {title}
+                    </button>
+                    <button
+                      type="button"
+                      className="text-blue-500 hover:text-blue-700"
+                      onClick={() =>
+                        setLinkedArticleIds((prev) => prev.filter((x) => x !== id))
+                      }
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </span>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 
       {/* Messages */}
-      <div ref={scrollAreaRef} className="flex-1 overflow-hidden">
+      <div ref={scrollAreaRef} className="flex-1 min-h-0 overflow-auto">
         {messages.length === 0 ? (
           <div className="flex flex-col h-full p-4">
-            <div className="flex flex-col items-center justify-center gap-3 flex-1 text-center">
+            <div className="flex flex-col items-center justify-center gap-3 flex-1 text-center min-h-0">
               <div className="w-12 h-12 rounded-2xl bg-[#e8f0fe] flex items-center justify-center">
                 <Sparkles className="h-6 w-6 text-[#1677ff]" />
               </div>
@@ -719,52 +906,56 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
                     </>
                   ) : (
                     <>
-                      查询、总结与分析 Preqin / Pitchbook 等来源
-                      <br />
-                      可使用右上角「导入」添加链接或上传文件
+                      基于入库资讯，随时提问、总结与分析
                     </>
                   )}
                 </p>
               </div>
+
+
+
             </div>
 
-            <div className="flex flex-wrap gap-1.5 justify-center mb-3">
-              {quickFilters.map((f) => (
-                <button
-                  key={f.label}
-                  type="button"
-                  onClick={f.onClick}
-                  className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full border border-[#1677ff]/25 bg-white text-[#1677ff] hover:bg-[#e8f0fe]"
-                >
-                  <Flame className="h-3 w-3" />
-                  {f.label}
-                </button>
-              ))}
-            </div>
-
-            <div className="space-y-2">
-              <p className="text-xs text-gray-400 text-center mb-2">快速提问</p>
-              <div className="grid grid-cols-1 gap-1.5">
-                {(articleId
-                  ? [
-                      "请总结这篇内容的核心结论",
-                      "这篇文章涉及哪些关键数据？",
-                      "请给出这篇内容的结构化要点",
-                      "文中有哪些风险与机会信号？",
-                    ]
-                  : SUGGESTED_PROMPTS
-                ).map((prompt) => (
-                  <button
-                    key={prompt}
-                    onClick={() => handleSend(prompt)}
-                    disabled={isLoading}
-                    className="text-left text-xs px-3 py-2 rounded-lg border border-gray-200 bg-gray-50 hover:bg-[#e8f0fe] hover:border-[#1677ff]/30 hover:text-[#1677ff] transition-all text-gray-600 disabled:opacity-50"
-                  >
-                    {prompt}
-                  </button>
-                ))}
+            {articleId && (
+              <div className="space-y-2">
+                <p className="text-xs text-gray-400 text-center mb-2">快速提问</p>
+                <div className="grid grid-cols-1 gap-1.5">
+                  {[
+                    "请总结这篇内容的核心结论",
+                    "这篇文章涉及哪些关键数据？",
+                    "请给出这篇内容的结构化要点",
+                    "文中有哪些风险与机会信号？",
+                  ].map((prompt) => (
+                    <button
+                      key={prompt}
+                      onClick={() => handleSend(prompt)}
+                      disabled={isLoading}
+                      className="text-left text-xs px-3 py-2 rounded-lg border border-gray-200 bg-gray-50 hover:bg-[#e8f0fe] hover:border-[#1677ff]/30 hover:text-[#1677ff] transition-all text-gray-600 disabled:opacity-50"
+                    >
+                      {prompt}
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
+
+            {!articleId && (
+              <div className="space-y-2">
+                <p className="text-xs text-gray-400 text-center mb-2">直接提问</p>
+                <div className="grid grid-cols-1 gap-1.5">
+                  {SUGGESTED_PROMPTS.slice(0, 4).map((prompt) => (
+                    <button
+                      key={prompt}
+                      onClick={() => handleSend(prompt)}
+                      disabled={isLoading}
+                      className="text-left text-xs px-3 py-2 rounded-lg border border-gray-200 bg-gray-50 hover:bg-[#e8f0fe] hover:border-[#1677ff]/30 hover:text-[#1677ff] transition-all text-gray-600 disabled:opacity-50"
+                    >
+                      {prompt}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         ) : (
           <ScrollArea className="h-full">
@@ -792,7 +983,7 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
                     >
                       {msg.role === "assistant" ? (
                         <div className="space-y-2">
-                          <AssistantBody content={msg.content} />
+                          <AssistantBody content={msg.content} onNavigate={setLocation} citations={cites} />
                           {!articleId && cites.length > 0 && (
                             <div className="flex flex-wrap gap-1.5">
                               {cites.map((c, i) => (
@@ -801,12 +992,12 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
                                   type="button"
                                   className="inline-flex items-center gap-1 rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-[11px] text-blue-700 hover:bg-blue-100"
                                   onClick={() => {
-                                    if (c.articleId > 0) setLocation(`/news/${c.articleId}`);
+                                    if (c.articleId > 0) setLocation(`/news/${c.articleId}?entry=chat`);
                                   }}
                                   title={c.title}
                                   disabled={c.articleId <= 0}
                                 >
-                                  📄
+                                  <span className="shrink-0 font-mono text-blue-500/80">#{c.articleId}</span>
                                   <span className="max-w-[180px] truncate">{c.title}</span>
                                 </button>
                               ))}
@@ -856,6 +1047,52 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
                                 </div>
                               </div>
                             )}
+                          <div className="flex items-center gap-1.5 pt-1">
+                            <button
+                              type="button"
+                              className={`inline-flex h-6 w-6 items-center justify-center rounded border ${
+                                feedbackMap[msg.id] === "like"
+                                  ? "border-green-300 bg-green-50 text-green-600"
+                                  : "border-gray-200 text-gray-400 hover:text-green-600 hover:border-green-200"
+                              }`}
+                              onClick={() =>
+                                setFeedbackMap((p) => ({ ...p, [msg.id]: "like" }))
+                              }
+                              title="有帮助"
+                            >
+                              <ThumbsUp className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              className={`inline-flex h-6 w-6 items-center justify-center rounded border ${
+                                feedbackMap[msg.id] === "dislike"
+                                  ? "border-rose-300 bg-rose-50 text-rose-600"
+                                  : "border-gray-200 text-gray-400 hover:text-rose-600 hover:border-rose-200"
+                              }`}
+                              onClick={() =>
+                                setFeedbackMap((p) => ({ ...p, [msg.id]: "dislike" }))
+                              }
+                              title="无帮助"
+                            >
+                              <ThumbsDown className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              className="inline-flex h-6 w-6 items-center justify-center rounded border border-gray-200 text-gray-400 hover:text-gray-700 hover:border-gray-300"
+                              onClick={() => handleRegenerate(msg.id)}
+                              title="重新生成"
+                            >
+                              <RefreshCw className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              className="inline-flex h-6 w-6 items-center justify-center rounded border border-gray-200 text-gray-400 hover:text-gray-700 hover:border-gray-300"
+                              onClick={() => void handleCopy(msg.content)}
+                              title="复制"
+                            >
+                              <Copy className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
                         </div>
                       ) : (
                         <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
@@ -900,38 +1137,6 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
 
       {/* Input */}
       <div className="p-3 border-t border-gray-100 bg-white shrink-0">
-        {articleId == null && !readingChipsDismissed && profileSnippet?.text ? (
-          <div className="mb-2 flex flex-wrap items-center gap-1.5">
-            <span className="text-[10px] text-gray-400 w-full sm:w-auto shrink-0">
-              结合你的阅读习惯的快捷问法：
-            </span>
-            {profileSnippet.text.split("；").filter(Boolean).map((chip, i) => (
-              <button
-                key={i}
-                type="button"
-                className="rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-[11px] text-gray-700 hover:bg-[#e8f0fe] hover:border-[#1677ff]/40"
-                onClick={() => setInput((prev) => (prev ? `${prev} ` : "") + `结合我近期阅读习惯，${chip}，请基于已入库资讯简要说明。`)}
-              >
-                {chip.slice(0, 24)}
-                {chip.length > 24 ? "…" : ""}
-              </button>
-            ))}
-            <button
-              type="button"
-              className="text-[10px] text-gray-400 underline decoration-dotted hover:text-gray-600"
-              onClick={() => {
-                try {
-                  localStorage.setItem("ipms_reading_chips_hidden", "1");
-                } catch {
-                  /* ignore */
-                }
-                setReadingChipsDismissed(true);
-              }}
-            >
-              不再显示
-            </button>
-          </div>
-        ) : null}
         <div className="flex gap-2 items-end">
           <Textarea
             ref={textareaRef}
@@ -957,10 +1162,161 @@ export default function NewsBot({ onClose, articleId }: NewsBotProps) {
         </div>
         <p className="text-xs text-gray-400 mt-1.5 text-center">
           {articleId
-            ? "当前回答默认仅基于本页文档，并附引用定位"
+            ? "当前回答默认仅基于本页文档；若问「浏览器插件 / 安装」等，会直接给出操作步骤（不依赖本文）"
             : "回答仅供参考；引用可点击图标跳转原文详情"}
         </p>
       </div>
+
+      <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
+        <DialogContent className="max-w-2xl gap-0 p-0 overflow-hidden">
+          <DialogHeader className="px-5 py-4 border-b border-gray-100">
+            <DialogTitle className="text-base text-gray-900">历史会话</DialogTitle>
+          </DialogHeader>
+          <ScrollArea className="max-h-[60vh]">
+            <div className="p-3 space-y-2">
+              {(sessionList ?? []).map((s) => (
+                <div
+                  key={s.sessionId}
+                  className={`rounded-lg border px-3 py-2 ${
+                    s.sessionId === sessionId ? "border-[#1677ff]/40 bg-blue-50/50" : "border-gray-200 bg-white"
+                  }`}
+                >
+                  {renamingSessionId === s.sessionId ? (
+                    <div className="flex items-center gap-2">
+                      <input
+                        value={renameInput}
+                        onChange={(e) => setRenameInput(e.target.value)}
+                        className="h-8 flex-1 rounded border border-gray-200 px-2 text-sm"
+                        placeholder="输入会话名称"
+                      />
+                      <Button
+                        size="sm"
+                        className="h-8"
+                        onClick={() => {
+                          if (!me?.id || !renameInput.trim()) return;
+                          renameSessionMutation.mutate({
+                            userId: me.id,
+                            sessionId: s.sessionId,
+                            title: renameInput.trim(),
+                          });
+                        }}
+                        disabled={renameSessionMutation.isPending || !renameInput.trim()}
+                      >
+                        保存
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-8"
+                        onClick={() => {
+                          setRenamingSessionId(null);
+                          setRenameInput("");
+                        }}
+                      >
+                        取消
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="flex items-start justify-between gap-2">
+                      <button
+                        type="button"
+                        className="min-w-0 flex-1 text-left"
+                        onClick={() => {
+                          setSessionId(s.sessionId);
+                          setStoredSessionId(CHAT_SESSION_KEY, s.sessionId);
+                          lastHistorySyncSession.current = null;
+                          setHistoryOpen(false);
+                        }}
+                      >
+                        <p className="text-sm text-gray-800 truncate">{s.title || "新对话"}</p>
+                        <p className="text-[11px] text-gray-400 mt-1">
+                          {new Date(s.lastAt).toLocaleString()} · {s.totalMessages} 条消息
+                        </p>
+                      </button>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded border border-gray-200 text-gray-500 hover:text-[#1677ff]"
+                          onClick={() => openRename(s.sessionId, s.title)}
+                          title="重命名"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded border border-gray-200 text-gray-500 hover:text-rose-600"
+                          onClick={() => {
+                            if (!me?.id) return;
+                            deleteSessionMutation.mutate({
+                              userId: me.id,
+                              sessionId: s.sessionId,
+                            });
+                          }}
+                          title="删除"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+              {(sessionList ?? []).length === 0 && (
+                <div className="text-center text-sm text-gray-400 py-10">暂无历史会话</div>
+              )}
+            </div>
+          </ScrollArea>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={chromeExtGuideOpen} onOpenChange={setChromeExtGuideOpen}>
+        <DialogContent className="max-w-lg gap-0 p-0 overflow-hidden sm:max-w-lg">
+          <DialogHeader className="px-5 pt-5 pb-2 border-b border-gray-100 space-y-2">
+            <DialogTitle className="text-base text-gray-900">
+              安装 IPMS 浏览器插件
+            </DialogTitle>
+            <p className="text-xs text-gray-500 font-normal leading-relaxed">
+              按下面步骤即可完成。Chrome
+              不允许网站对未上架扩展「静默一键安装」，先下载再解压加载是正常、安全的方式。
+            </p>
+          </DialogHeader>
+
+          <ScrollArea className="max-h-[55vh] px-5 py-3">
+            {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions */}
+            <div
+              className="prose prose-sm max-w-none text-gray-700 pr-3 [&_h2]:text-sm [&_h2]:font-semibold [&_h2]:mt-3 [&_h2]:mb-1.5 [&_h2]:first:mt-0 [&_a]:text-[#1677ff] [&_img]:rounded-lg [&_img]:border [&_img]:border-gray-200 [&_img]:shadow-sm [&_img]:my-2"
+              onClick={(e) => {
+                const a = (e.target as HTMLElement).closest?.("a");
+                if (a?.href?.startsWith("chrome://")) {
+                  e.preventDefault();
+                  tryOpenChromeExtensionsPage();
+                }
+              }}
+            >
+              <Streamdown rehypePlugins={getRehypePluginsWithOrigin()}>
+                {getChromeExtensionUserGuideMarkdown(
+                  typeof window !== "undefined" ? window.location.origin : ""
+                )}
+              </Streamdown>
+            </div>
+          </ScrollArea>
+          <DialogFooter className="px-5 py-4 border-t border-gray-100 bg-gray-50/80 flex-col sm:flex-row gap-2 shrink-0">
+            <Button variant="secondary" className="w-full sm:w-auto order-2 sm:order-1" type="button" onClick={() => setChromeExtGuideOpen(false)}>
+              关闭
+            </Button>
+            <Button asChild className="w-full sm:w-auto order-1 sm:order-2 bg-violet-600 hover:bg-violet-700 text-white">
+              <a
+                href={chromeExtensionZipUrl(
+                  typeof window !== "undefined" ? window.location.origin : ""
+                )}
+                download="ipms-news-importer.zip"
+              >
+                下载 ZIP 文件
+              </a>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
+import fs from "fs";
+import path from "path";
 import { publicProcedure, router } from "../_core/trpc";
 import {
   getNewsArticleById,
@@ -7,6 +9,8 @@ import {
   insertPdfHighlight,
   deletePdfHighlight,
   listReadingImagesByArticle,
+  updateReadingImageCaption,
+  deleteReadingImage,
   insertReadingEvent,
   getUserReadingProfile,
   rollupUserReadingProfile,
@@ -109,6 +113,48 @@ export const readingRouter = router({
     .query(async ({ input, ctx }) => {
       await assertArticleReadable(input.articleId, ctx.user?.role);
       return listReadingImagesByArticle(input.articleId);
+    }),
+
+  readingImageUpdate: publicProcedure
+    .input(
+      z.object({
+        id: z.number().int(),
+        caption: z.string().max(200).optional(),
+        sessionId: z.string().max(64).optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const ok = await updateReadingImageCaption(
+        input.id,
+        (input.caption ?? "").trim() || null,
+        ctx.user?.id ?? null,
+        ctx.user?.role === "admin",
+        input.sessionId ?? null
+      );
+      if (!ok) throw new TRPCError({ code: "FORBIDDEN", message: "无权编辑该图片" });
+      return { success: true };
+    }),
+
+  readingImageDelete: publicProcedure
+    .input(
+      z.object({
+        id: z.number().int(),
+        sessionId: z.string().max(64).optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const out = await deleteReadingImage(
+        input.id,
+        ctx.user?.id ?? null,
+        ctx.user?.role === "admin",
+        input.sessionId ?? null
+      );
+      if (!out.ok) throw new TRPCError({ code: "FORBIDDEN", message: "无权删除该图片" });
+      if (out.storageKey) {
+        const abs = path.join(process.cwd(), "uploads", "news", out.storageKey);
+        fs.unlink(abs, () => {});
+      }
+      return { success: true };
     }),
 
   logEvent: publicProcedure

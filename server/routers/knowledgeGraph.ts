@@ -5,6 +5,7 @@ import {
   getAllEntityRelations,
   getEntityArticleLinks,
   getNewsArticleById,
+  mergeDuplicateEntitiesByMatchKey,
 } from "../db";
 import { extractAndStoreEntities } from "../_core/entityExtraction";
 
@@ -52,4 +53,10 @@ export const knowledgeGraphRouter = router({
       await extractAndStoreEntities(article);
       return { success: true };
     }),
+
+  /** 按规范化名合并重复实体、迁移边并去重关系（与定时任务相同逻辑） */
+  mergeDuplicateEntities: adminProcedure.mutation(async () => {
+    const { groupsMerged, entitiesRemoved } = await mergeDuplicateEntitiesByMatchKey();
+    return { success: true as const, groupsMerged, entitiesRemoved };
+  }),
 });

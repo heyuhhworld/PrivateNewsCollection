@@ -15,7 +15,7 @@ type PdfTextItem = {
   width: number;
   height: number;
 };
-import { ChevronLeft, ChevronRight, Highlighter, ImageIcon } from "lucide-react";
+import { ChevronLeft, ChevronRight, Crop, Highlighter, ImageIcon } from "lucide-react";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 
@@ -274,8 +274,10 @@ export function PdfCitationViewer({
   const [highlightRects, setHighlightRects] = useState<Rect[]>([]);
   const [renderTick, setRenderTick] = useState(0);
   const [canvasCssSize, setCanvasCssSize] = useState({ w: 0, h: 0 });
-  /** 当前页是否存在可选中文本（扫描版 PDF 常为 false） */
   const [pageHasSelectableText, setPageHasSelectableText] = useState<boolean | null>(null);
+  const [cropMode, setCropMode] = useState(false);
+  const [cropRect, setCropRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const cropStartRef = useRef<{ sx: number; sy: number } | null>(null);
 
   const renderTaskRef = useRef<{ cancel: () => void } | null>(null);
   const renderGenRef = useRef(0);
@@ -496,21 +498,77 @@ export function PdfCitationViewer({
     });
   };
 
-  const handleSavePageImage = () => {
+  const handleToggleCropMode = () => {
+    if (cropMode) {
+      setCropMode(false);
+      setCropRect(null);
+      cropStartRef.current = null;
+    } else {
+      setCropMode(true);
+      setCropRect(null);
+    }
+  };
+
+  const handleCropMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!cropMode) return;
+    const box = pageBoxRef.current;
+    if (!box) return;
+    const br = box.getBoundingClientRect();
+    const sx = e.clientX - br.left;
+    const sy = e.clientY - br.top;
+    cropStartRef.current = { sx, sy };
+    setCropRect({ x: sx, y: sy, w: 0, h: 0 });
+  };
+
+  const handleCropMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!cropMode || !cropStartRef.current) return;
+    const box = pageBoxRef.current;
+    if (!box) return;
+    const br = box.getBoundingClientRect();
+    const cx = Math.max(0, Math.min(e.clientX - br.left, canvasCssSize.w));
+    const cy = Math.max(0, Math.min(e.clientY - br.top, canvasCssSize.h));
+    const { sx, sy } = cropStartRef.current;
+    setCropRect({
+      x: Math.min(sx, cx),
+      y: Math.min(sy, cy),
+      w: Math.abs(cx - sx),
+      h: Math.abs(cy - sy),
+    });
+  };
+
+  const handleCropMouseUp = () => {
+    cropStartRef.current = null;
+  };
+
+  const handleSaveCropImage = () => {
     if (!articleId) {
       toast.message("仅在对已入库文章预览时可存图");
       return;
     }
     const canvas = canvasRef.current;
     if (!canvas || canvas.width < 2) return;
-    canvas.toBlob(
+
+    const scale = canvas.width / canvasCssSize.w;
+    let sx = 0, sy = 0, sw = canvas.width, sh = canvas.height;
+    if (cropRect && cropRect.w > 10 && cropRect.h > 10) {
+      sx = Math.round(cropRect.x * scale);
+      sy = Math.round(cropRect.y * scale);
+      sw = Math.round(cropRect.w * scale);
+      sh = Math.round(cropRect.h * scale);
+    }
+
+    const tmpCanvas = document.createElement("canvas");
+    tmpCanvas.width = sw;
+    tmpCanvas.height = sh;
+    const ctx = tmpCanvas.getContext("2d");
+    if (!ctx) { toast.error("导出图片失败"); return; }
+    ctx.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+
+    tmpCanvas.toBlob(
       (blob) => {
-        if (!blob) {
-          toast.error("导出图片失败");
-          return;
-        }
+        if (!blob) { toast.error("导出图片失败"); return; }
         const fd = new FormData();
-        fd.append("file", blob, "page.png");
+        fd.append("file", blob, "crop.png");
         fd.append("articleId", String(articleId));
         fd.append("sourcePage", String(safePage));
         if (sessionId) fd.append("sessionId", sessionId);
@@ -520,18 +578,17 @@ export function PdfCitationViewer({
           credentials: "include",
         })
           .then(async (r) => {
-            const j = (await r.json().catch(() => ({}))) as {
-              error?: string;
-              success?: boolean;
-            };
+            const j = (await r.json().catch(() => ({}))) as { error?: string; success?: boolean };
             if (!r.ok) throw new Error(j.error || r.statusText);
             toast.success("已加入图片流");
+            setCropMode(false);
+            setCropRect(null);
             void utils.reading.readingImagesList.invalidate({ articleId });
           })
           .catch((e: Error) => toast.error(e.message));
       },
       "image/png",
-      0.92
+      0.92,
     );
   };
 
@@ -562,7 +619,7 @@ export function PdfCitationViewer({
 
   return (
     <div className="flex flex-1 min-h-0 flex-col gap-2">
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 px-1">
+      <div className="sticky top-0 z-20 -mx-1 border-b border-gray-100 bg-white/95 px-2 py-1 backdrop-blur flex shrink-0 flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-1">
           <button
             type="button"
@@ -591,21 +648,36 @@ export function PdfCitationViewer({
             <>
               <button
                 type="button"
-                disabled={saveHighlightMut.isPending}
+                disabled={saveHighlightMut.isPending || pageHasSelectableText === false}
                 onClick={handleSaveHighlight}
                 className="inline-flex items-center gap-1 rounded border border-amber-200 bg-amber-50/90 px-2 py-1 text-[11px] font-medium text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+                title={pageHasSelectableText === false ? "当前页面无文本层，无法划词高亮" : undefined}
               >
                 <Highlighter className="h-3 w-3" />
                 保存选区为团队高亮
               </button>
               <button
                 type="button"
-                onClick={handleSavePageImage}
-                className="inline-flex items-center gap-1 rounded border border-sky-200 bg-sky-50/90 px-2 py-1 text-[11px] font-medium text-sky-900 hover:bg-sky-100"
+                onClick={handleToggleCropMode}
+                className={`inline-flex items-center gap-1 rounded border px-2 py-1 text-[11px] font-medium ${
+                  cropMode
+                    ? "border-blue-400 bg-blue-100 text-blue-900"
+                    : "border-sky-200 bg-sky-50/90 text-sky-900 hover:bg-sky-100"
+                }`}
               >
-                <ImageIcon className="h-3 w-3" />
-                本页存图
+                <Crop className="h-3 w-3" />
+                {cropMode ? "取消截图" : "区域截图"}
               </button>
+              {cropMode && cropRect && cropRect.w > 10 && cropRect.h > 10 && (
+                <button
+                  type="button"
+                  onClick={handleSaveCropImage}
+                  className="inline-flex items-center gap-1 rounded border border-green-300 bg-green-50 px-2 py-1 text-[11px] font-medium text-green-900 hover:bg-green-100"
+                >
+                  <ImageIcon className="h-3 w-3" />
+                  加入图片流
+                </button>
+              )}
             </>
           ) : null}
           {citationHighlight && highlightRects.length > 0 ? (
@@ -629,18 +701,26 @@ export function PdfCitationViewer({
           下载后本地查看。
         </div>
       ) : null}
+      {cropMode && cropRect && cropRect.w > 10 && cropRect.h > 10 ? (
+        <div className="shrink-0 rounded border border-green-200 bg-green-50 px-2 py-1.5 text-[11px] text-green-900">
+          选区已就绪：点击右上角「加入图片流」即可保存到图片流页签。
+        </div>
+      ) : null}
       <div
         ref={wrapRef}
         className="relative flex min-h-[200px] flex-1 justify-center overflow-auto rounded-lg border border-gray-200 bg-neutral-700/5"
       >
         <div
           ref={pageBoxRef}
-          className="relative inline-block shadow-sm"
+          className={`relative inline-block shadow-sm ${cropMode ? "cursor-crosshair" : ""}`}
           style={
             vw > 0 && vh > 0
               ? { width: vw, minHeight: vh }
               : { minWidth: 200, minHeight: 200 }
           }
+          onMouseDown={handleCropMouseDown}
+          onMouseMove={handleCropMouseMove}
+          onMouseUp={handleCropMouseUp}
         >
           <canvas ref={canvasRef} className="block max-w-full" />
           <div
@@ -684,8 +764,24 @@ export function PdfCitationViewer({
             style={{
               width: vw || "100%",
               height: vh || "100%",
+              pointerEvents: cropMode ? "none" : undefined,
             }}
           />
+          {cropMode && (
+            <div className="absolute inset-0 z-[15]" style={{ pointerEvents: "none" }}>
+              {cropRect && cropRect.w > 2 && cropRect.h > 2 && (
+                <div
+                  className="absolute border-2 border-blue-500 bg-blue-500/10"
+                  style={{
+                    left: cropRect.x,
+                    top: cropRect.y,
+                    width: cropRect.w,
+                    height: cropRect.h,
+                  }}
+                />
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
