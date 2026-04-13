@@ -657,9 +657,12 @@ export default function News() {
               ) ? (
                 <p className="text-xs text-amber-800 mt-3 max-w-md leading-relaxed rounded border border-amber-100 bg-amber-50/80 px-2 py-1.5">
                   这通常表示<strong>浏览器没连上本机后端</strong>（不是数据库缺列）。请确认终端里已运行{" "}
-                  <code className="rounded bg-white px-1">pnpm dev</code>，并用{" "}
-                  <code className="rounded bg-white px-1">http://localhost:3000</code>{" "}
-                  打开本站后再试；若端口不是 3000，请与终端里「Server running on …」一致。
+                  <code className="rounded bg-white px-1">pnpm dev</code>，并用终端里打印的地址打开（默认{" "}
+                  <code className="rounded bg-white px-1">http://127.0.0.1:3000</code>{" "}
+                  或 localhost）。可先新开标签访问{" "}
+                  <code className="rounded bg-white px-1">/api/health</code>{" "}
+                  同端口，应看到 <code className="rounded bg-white px-1">{`{"ok":true}`}</code>{" "}
+                  说明后端已起来。
                 </p>
               ) : null}
               <p className="text-xs text-gray-500 mt-4 max-w-md leading-relaxed">
