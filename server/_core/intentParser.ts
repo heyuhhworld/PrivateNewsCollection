@@ -2,7 +2,7 @@ import { invokeLLM } from "./llm";
 
 export type ParsedNewsIntent = {
   keyword?: string | null;
-  source?: "Preqin" | "Pitchbook" | "Manual" | null;
+  source?: "Preqin" | "Pitchbook" | "Manual" | "ChromeExtension" | null;
   strategy?: string | null;
   region?: string | null;
   recordCategory?: "report" | "news" | null;
@@ -18,7 +18,7 @@ const INTENT_SCHEMA = {
     type: "object",
     properties: {
       keyword: { type: "string", description: "关键词，可空字符串" },
-      source: { type: "string", enum: ["Preqin", "Pitchbook", "Manual", ""] },
+      source: { type: "string", enum: ["Preqin", "Pitchbook", "Manual", "ChromeExtension", ""] },
       strategy: { type: "string" },
       region: { type: "string" },
       recordCategory: { type: "string", enum: ["report", "news", ""] },
@@ -64,9 +64,18 @@ export async function parseNewsSearchIntent(
     const t = (s ?? "").trim();
     return t.length ? t : null;
   };
+  const rawSource = norm(o.source as string);
+  const sourceNorm: ParsedNewsIntent["source"] | null =
+    rawSource === "Preqin" ||
+    rawSource === "Pitchbook" ||
+    rawSource === "Manual" ||
+    rawSource === "ChromeExtension"
+      ? rawSource
+      : null;
+
   return {
     keyword: norm(o.keyword as string),
-    source: norm(o.source as string) as ParsedNewsIntent["source"],
+    source: sourceNorm,
     strategy: norm(o.strategy as string) as ParsedNewsIntent["strategy"],
     region: norm(o.region as string) as ParsedNewsIntent["region"],
     recordCategory: norm(o.recordCategory as string) as ParsedNewsIntent["recordCategory"],

@@ -159,7 +159,7 @@ export async function getUserById(id: number) {
 // ─── News Articles ───────────────────────────────────────────────────────────
 
 export interface NewsFilter {
-  source?: "Preqin" | "Pitchbook" | "Manual";
+  source?: "Preqin" | "Pitchbook" | "Manual" | "ChromeExtension";
   strategy?: string;
   region?: string;
   tag?: string;

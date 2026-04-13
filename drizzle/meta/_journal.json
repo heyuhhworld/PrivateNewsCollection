@@ -71,6 +71,13 @@
       "when": 1776410000000,
       "tag": "0014_reading_interaction",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "5",
+      "when": 1776420000000,
+      "tag": "0015_news_source_chrome_extension",
+      "breakpoints": true
     }
   ]
 }

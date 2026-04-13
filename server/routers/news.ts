@@ -362,7 +362,7 @@ export const newsRouter = router({
   list: publicProcedure
     .input(
       z.object({
-        source: z.enum(["Preqin", "Pitchbook", "Manual"]).optional(),
+        source: z.enum(["Preqin", "Pitchbook", "Manual", "ChromeExtension"]).optional(),
         strategy: z.string().optional(),
         region: z.string().optional(),
         tag: z.string().optional(),

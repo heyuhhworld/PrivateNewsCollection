@@ -215,13 +215,47 @@ async function main() {
       }
     }
 
-    if (!(await tableExists(conn, "article_pdf_highlights"))) {
+    {
       const p14 = path.join(root, "drizzle/0014_reading_interaction.sql");
-      const sql14 = readFileSync(p14, "utf8").trim();
-      await conn.query(sql14);
-      console.log("已执行 0014：reading interaction 表");
-    } else {
-      console.log("article_pdf_highlights 等 reading 表已存在");
+      const raw14 = readFileSync(p14, "utf8");
+      const stmts14 = raw14
+        .split(/-->\s*statement-breakpoint\s*/g)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      for (const stmt of stmts14) {
+        const m = /^CREATE TABLE IF NOT EXISTS `([^`]+)`/i.exec(stmt);
+        const tname = m?.[1];
+        if (!tname) continue;
+        if (await tableExists(conn, tname)) continue;
+        await conn.query(stmt);
+        console.log(`已创建 ${tname}（0014 补齐）`);
+      }
+      const need14 = [
+        "article_pdf_highlights",
+        "article_reading_images",
+        "reading_events",
+        "user_reading_profiles",
+      ];
+      const all14 = await Promise.all(need14.map((n) => tableExists(conn, n)));
+      if (all14.every(Boolean)) {
+        console.log("0014 reading 相关表已齐");
+      }
+    }
+
+    if (await tableExists(conn, "news_articles")) {
+      const [[row]] = await conn.query(
+        `SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'news_articles' AND COLUMN_NAME = 'source'`
+      );
+      const ct = String(row?.t ?? "");
+      if (!ct.includes("ChromeExtension")) {
+        await conn.query(
+          "ALTER TABLE `news_articles` MODIFY COLUMN `source` ENUM('Preqin','Pitchbook','Manual','ChromeExtension') NOT NULL"
+        );
+        console.log("已扩展 news_articles.source 枚举：ChromeExtension");
+      } else {
+        console.log("news_articles.source 已含 ChromeExtension");
+      }
     }
 
     console.log("\nschema 检查完成。请重启 pnpm dev 后重试。");

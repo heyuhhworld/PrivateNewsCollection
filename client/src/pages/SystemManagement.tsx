@@ -609,6 +609,22 @@ export default function SystemManagement() {
     stopRunMutation.mutate({ id: jobId });
   }
 
+  /** runNow 会长时间 await，mutation.isPending 在全局为 true；仅应对「当前这次触发的任务」转圈，避免其它行误显示执行中 */
+  function runNowButtonState(jobId: number) {
+    const v = runNowMutation.variables as { id?: number } | undefined;
+    const pendingId = v?.id;
+    const thisRunPending = runNowMutation.isPending && pendingId === jobId;
+    const otherRunPending =
+      runNowMutation.isPending &&
+      pendingId !== undefined &&
+      pendingId !== jobId;
+    const otherJobRunning = runningJobId != null && runningJobId !== jobId;
+    return {
+      disabled: thisRunPending || otherRunPending || otherJobRunning,
+      showSpinner: thisRunPending,
+    };
+  }
+
   async function handleRefreshJobs() {
     setRefreshingJobs(true);
     try {
@@ -1057,7 +1073,12 @@ export default function SystemManagement() {
             </div>
           ) : (
             <div className="divide-y divide-gray-50">
-              {jobs.map((job) => (
+              {jobs.map((job) => {
+                const runNowUi = runNowButtonState(job.id);
+                const stopVars = stopRunMutation.variables as { id?: number } | undefined;
+                const stopThisPending =
+                  stopRunMutation.isPending && stopVars?.id === job.id;
+                return (
                 <div key={job.id}>
                   <div className="px-5 py-4">
                     <div className="flex items-start justify-between gap-4">
@@ -1137,9 +1158,9 @@ export default function SystemManagement() {
                             size="sm"
                             className="h-7 px-2 text-xs gap-1 text-red-600 hover:text-red-700"
                             onClick={() => handleStopRun(job.id)}
-                            disabled={stopRunMutation.isPending}
+                            disabled={stopThisPending}
                           >
-                            {stopRunMutation.isPending ? (
+                            {stopThisPending ? (
                               <Loader2 className="h-3.5 w-3.5 animate-spin" />
                             ) : (
                               <Square className="h-3.5 w-3.5" />
@@ -1152,9 +1173,9 @@ export default function SystemManagement() {
                             size="sm"
                             className="h-7 px-2 text-xs gap-1 text-gray-500 hover:text-green-600"
                             onClick={() => handleRunNow(job.id)}
-                            disabled={runNowMutation.isPending}
+                            disabled={runNowUi.disabled}
                           >
-                            {runNowMutation.isPending ? (
+                            {runNowUi.showSpinner ? (
                               <Loader2 className="h-3.5 w-3.5 animate-spin" />
                             ) : (
                               <Play className="h-3.5 w-3.5" />
@@ -1250,7 +1271,8 @@ export default function SystemManagement() {
                     </div>
                   )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -1330,9 +1352,9 @@ export default function SystemManagement() {
                             {row.recordCategory === "report" ? "报告" : "资讯"}
                           </span>
                           <span>{row.source}</span>
-                          {row.source === "Manual" && (
+                          {(row.source === "Manual" || row.source === "ChromeExtension") && (
                             <span className="text-gray-600">
-                              上传人{" "}
+                              {row.source === "ChromeExtension" ? "插件导入人" : "上传人"}{" "}
                               {row.uploaderName?.trim() ||
                                 row.uploaderEmail?.trim() ||
                                 (row.uploaderUserId != null

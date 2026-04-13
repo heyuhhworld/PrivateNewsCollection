@@ -30,6 +30,7 @@ import {
   X,
   Flame,
   Sparkles,
+  Puzzle,
 } from "lucide-react";
 import { format } from "date-fns";
 import { zhCN } from "date-fns/locale";
@@ -45,16 +46,20 @@ const STRATEGIES = [
 ];
 const REGIONS = ["全球", "亚太", "北美", "欧洲", "中国", "东南亚", "中东", "其他"];
 
-/** 列表标题前：手工上传 / 自动导入（站点抓取），不占用标签位 */
+/** 列表标题前：来源图标（手工 / 浏览器插件 / 站点自动导入） */
 function ImportSourceIcon({ source }: { source: string }) {
   const manual = source === "Manual";
+  const ext = source === "ChromeExtension";
+  const title = manual ? "手工上传" : ext ? "浏览器插件导入" : "自动导入（站点抓取）";
   return (
     <span
-      title={manual ? "手工上传" : "自动导入"}
+      title={title}
       className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600"
     >
       {manual ? (
         <Upload className="h-3.5 w-3.5 text-slate-600" />
+      ) : ext ? (
+        <Puzzle className="h-3.5 w-3.5 text-violet-600" />
       ) : (
         <Globe className="h-3.5 w-3.5 text-[#1677ff]" />
       )}
@@ -64,7 +69,8 @@ function ImportSourceIcon({ source }: { source: string }) {
 
 function shouldShowAsTag(tag: string, strategy: string | null, region: string | null) {
   if (tag === strategy || tag === region) return false;
-  if (["手工上传", "Preqin", "Pitchbook", "PitchBook"].includes(tag)) return false;
+  if (["手工上传", "Preqin", "Pitchbook", "PitchBook", "ChromeExtension", "浏览器插件"].includes(tag))
+    return false;
   return true;
 }
 
@@ -103,7 +109,7 @@ function getSessionId(): string {
 
 export default function News() {
   const [, setLocation] = useLocation();
-  const [source, setSource] = useState<"Preqin" | "Pitchbook" | "Manual" | "">("")
+  const [source, setSource] = useState<"Preqin" | "Pitchbook" | "Manual" | "ChromeExtension" | "">("")
   const [strategy, setStrategy] = useState("");
   const [region, setRegion] = useState("");
   const [keyword, setKeyword] = useState("");
@@ -208,7 +214,12 @@ export default function News() {
     onSuccess: (out) => {
       const i = out.intent as Record<string, unknown>;
       if (!out.semanticOnly && i) {
-        if (i.source === "Preqin" || i.source === "Pitchbook" || i.source === "Manual") {
+        if (
+          i.source === "Preqin" ||
+          i.source === "Pitchbook" ||
+          i.source === "Manual" ||
+          i.source === "ChromeExtension"
+        ) {
           setSource(i.source);
         }
         if (typeof i.strategy === "string" && i.strategy) setStrategy(i.strategy);
@@ -234,7 +245,7 @@ export default function News() {
     const q = searchInput.trim();
     if (!q) {
       setAiSearchHint(
-        "请先在左侧输入框里用一句话描述想找的内容，再点「AI」。示例：最近一周亚太私募股权资讯、只看 Pitchbook 房地产报告"
+        "请先在输入框里用一句话描述想找的内容，再点「AI」或按回车。示例：最近一周亚太私募股权资讯、只看 Pitchbook 房地产报告"
       );
       return;
     }
@@ -245,12 +256,6 @@ export default function News() {
   const displayItems = smartList?.items ?? data?.items ?? [];
   const showMainLoading = !smartList && isLoading;
   const showMainError = !smartList && isError;
-
-  const handleSearch = useCallback(() => {
-    setSmartList(null);
-    setKeyword(searchInput);
-    setPage(1);
-  }, [searchInput]);
 
   const handleClearKeyword = useCallback(() => {
     setKeyword("");
@@ -371,29 +376,24 @@ export default function News() {
             筛选：
           </div>
 
-          {/* Search：与右侧「AI 资讯助手」无关；AI 按钮只解析本行输入并刷新下方列表 */}
+          {/* 仅 AI 检索：本行输入由 smartSearch 解析筛选或语义检索 */}
           <div className="flex flex-col gap-1 flex-1 min-w-[200px] max-w-lg">
             <div className="flex items-center gap-1.5">
               <div className="relative flex-1 min-w-0">
                 <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
                 <Input
-                  placeholder="关键词搜索；或输入一句话后点「AI」智能筛选/语义检索"
+                  placeholder="用自然语言描述想找的内容，点「AI」或按回车"
                   value={searchInput}
                   onChange={(e) => {
                     setSearchInput(e.target.value);
                     setAiSearchHint(null);
                   }}
-                  onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void handleAiSearch();
+                  }}
                   className="pl-8 h-8 text-sm border-gray-200"
                 />
               </div>
-              <Button
-                size="sm"
-                onClick={handleSearch}
-                className="h-8 px-3 bg-[#1677ff] hover:bg-[#0958d9] text-white text-xs shrink-0"
-              >
-                搜索
-              </Button>
               <Button
                 size="sm"
                 variant="secondary"
@@ -418,7 +418,7 @@ export default function News() {
             value={source || "all"}
             onValueChange={(v) => {
               setSmartList(null);
-              setSource(v === "all" ? "" : (v as "Preqin" | "Pitchbook" | "Manual"));
+              setSource(v === "all" ? "" : (v as "Preqin" | "Pitchbook" | "Manual" | "ChromeExtension"));
               setPage(1);
             }}
           >
@@ -430,6 +430,7 @@ export default function News() {
               <SelectItem value="Preqin">Preqin</SelectItem>
               <SelectItem value="Pitchbook">Pitchbook</SelectItem>
               <SelectItem value="Manual">手工上传</SelectItem>
+              <SelectItem value="ChromeExtension">浏览器插件</SelectItem>
             </SelectContent>
           </Select>
 
@@ -656,13 +657,18 @@ export default function News() {
                 String(error?.message ?? "")
               ) ? (
                 <p className="text-xs text-amber-800 mt-3 max-w-md leading-relaxed rounded border border-amber-100 bg-amber-50/80 px-2 py-1.5">
-                  这通常表示<strong>浏览器没连上本机后端</strong>（不是数据库缺列）。请确认终端里已运行{" "}
-                  <code className="rounded bg-white px-1">pnpm dev</code>，并用终端里打印的地址打开（默认{" "}
-                  <code className="rounded bg-white px-1">http://127.0.0.1:3000</code>{" "}
-                  或 localhost）。可先新开标签访问{" "}
-                  <code className="rounded bg-white px-1">/api/health</code>{" "}
-                  同端口，应看到 <code className="rounded bg-white px-1">{`{"ok":true}`}</code>{" "}
-                  说明后端已起来。
+                  这通常表示<strong>浏览器没连上本机后端</strong>（不是数据库缺列）。请先确认终端里{" "}
+                  <code className="rounded bg-white px-1">pnpm dev</code>{" "}
+                  仍在运行，且地址栏主机与端口与终端一致（<code className="rounded bg-white px-1">localhost</code> 与{" "}
+                  <code className="rounded bg-white px-1">127.0.0.1</code>{" "}
+                  在部分环境不等价；完整探活会两路都测）。另开终端执行{" "}
+                  <code className="rounded bg-white px-1">pnpm run dev:verify</code>
+                  ，其中 <code className="rounded bg-white px-1">browserTrpcNewsList</code>{" "}
+                  与页面列表同源（httpBatchLink + superjson + credentials）。一键重启：{" "}
+                  <code className="rounded bg-white px-1">pnpm run dev:restart</code>
+                  。轻量探活：{" "}
+                  <code className="rounded bg-white px-1">pnpm run dev:check</code>{" "}
+                  或访问 <code className="rounded bg-white px-1">/api/health</code>。
                 </p>
               ) : null}
               <p className="text-xs text-gray-500 mt-4 max-w-md leading-relaxed">

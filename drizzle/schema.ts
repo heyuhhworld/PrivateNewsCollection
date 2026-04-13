@@ -31,7 +31,7 @@ export const newsArticles = mysqlTable("news_articles", {
   title: varchar("title", { length: 512 }).notNull(),
   summary: text("summary"),
   content: text("content"),
-  source: mysqlEnum("source", ["Preqin", "Pitchbook", "Manual"]).notNull(),
+  source: mysqlEnum("source", ["Preqin", "Pitchbook", "Manual", "ChromeExtension"]).notNull(),
   originalUrl: varchar("originalUrl", { length: 1024 }),
   author: varchar("author", { length: 128 }),
   // 标签：JSON 数组，如 ["私募股权", "亚太", "并购"]
@@ -287,6 +287,10 @@ export type InsertReadingEvent = typeof readingEvents.$inferInsert;
 export const userReadingProfiles = mysqlTable("user_reading_profiles", {
   userId: int("userId").notNull().primaryKey(),
   summaryJson: json("summaryJson").$type<Record<string, unknown>>().notNull(),
+  /** 用户对「每日简报」正文的额外写作要求（合并进 system prompt） */
+  briefingInstruction: text("briefingInstruction"),
+  /** 已在简报页看过默认 prompt 说明（含「暂不调整」），不再自动弹层 */
+  briefingIntroCompleted: boolean("briefingIntroCompleted").default(false).notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
 

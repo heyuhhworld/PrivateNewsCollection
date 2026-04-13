@@ -230,6 +230,12 @@ export function registerNewsUploadRoutes(app: Express) {
         return;
       }
 
+      const channel = String(req.headers["x-ipms-import-channel"] ?? "")
+        .trim()
+        .toLowerCase();
+      const articleSource =
+        channel === "chrome-extension" ? ("ChromeExtension" as const) : ("Manual" as const);
+
       const db = await getDb();
       if (!db) {
         if (file.path) fs.unlink(file.path, () => {});
@@ -315,7 +321,7 @@ export function registerNewsUploadRoutes(app: Express) {
             : [];
 
         await db.insert(newsArticles).values({
-          source: "Manual",
+          source: articleSource,
           title: meta.title as string,
           summary: meta.summary as string,
           content: meta.content as string,

@@ -22,6 +22,7 @@ import {
   Sparkles,
   Upload,
   X,
+  Puzzle,
 } from "lucide-react";
 import { Streamdown } from "streamdown";
 import { format } from "date-fns";
@@ -44,13 +45,17 @@ function getSessionId(): string {
 
 function ImportSourceIcon({ source }: { source: string }) {
   const manual = source === "Manual";
+  const ext = source === "ChromeExtension";
+  const title = manual ? "手工上传" : ext ? "浏览器插件导入" : "自动导入（站点抓取）";
   return (
     <span
-      title={manual ? "手工上传" : "自动导入"}
+      title={title}
       className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-600"
     >
       {manual ? (
         <Upload className="h-4 w-4 text-slate-600" />
+      ) : ext ? (
+        <Puzzle className="h-4 w-4 text-violet-600" />
       ) : (
         <Globe className="h-4 w-4 text-[#1677ff]" />
       )}
@@ -425,11 +430,11 @@ export default function NewsDetail() {
     );
   }
 
-  const isManual = article.source === "Manual";
+  const isUploadedDoc = article.source === "Manual" || article.source === "ChromeExtension";
   const legacySourceLink =
     article.originalUrl && !article.originalUrl.startsWith("manual://");
   const hasFilePreview = Boolean(attachmentPublicUrl);
-  const splitReportLayout = isManual && hasFilePreview;
+  const splitReportLayout = isUploadedDoc && hasFilePreview;
 
   const getPreviewPanelEl = () =>
     document.getElementById("news-original-preview") ||
@@ -593,10 +598,13 @@ export default function NewsDetail() {
                     暂无中文译本时显示抓取原文；可通过再次执行链接导入以生成中文正文（需 LLM 配置可用）。
                   </p>
                 )}
-                {isManual && (
+                {isUploadedDoc && (
                   <p className="text-xs text-gray-400 pl-3">
-                    正文由上传文件解析与整理生成；对照请以{splitReportLayout ? "左" : "右"}
-                    侧原文件为准。
+                    {hasFilePreview
+                      ? `正文由${article.source === "ChromeExtension" ? "插件上传文件" : "上传文件"}解析与整理生成；对照请以${splitReportLayout ? "左" : "右"}侧原文件为准。`
+                      : article.source === "ChromeExtension"
+                        ? "正文由浏览器插件剪藏网页并由模型整理生成；可点击页顶链接查看原页面。"
+                        : "正文由上传文件解析与整理生成。"}
                   </p>
                 )}
               </div>
@@ -835,6 +843,16 @@ export default function NewsDetail() {
                 {article.author}
               </span>
             )}
+            {(article.source === "Manual" || article.source === "ChromeExtension") &&
+              "uploader" in article &&
+              article.uploader &&
+              (article.uploader.name?.trim() || article.uploader.email?.trim()) && (
+                <span className="flex items-center gap-1.5 text-gray-500">
+                  <User className="h-3.5 w-3.5 shrink-0" />
+                  导入人：
+                  {article.uploader.name?.trim() || article.uploader.email}
+                </span>
+              )}
             {legacySourceLink && (
               <a
                 href={article.originalUrl!}

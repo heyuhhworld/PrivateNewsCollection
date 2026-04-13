@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "IPMS 资讯导入",
+  "version": "1.0.0",
+  "description": "将当前网页或本地 PDF/Word 导入 IPMS 资讯库（与站内手工导入同一套处理；来源标记为浏览器插件）。",
+  "permissions": ["storage", "activeTab", "scripting", "cookies"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "IPMS 导入"
+  },
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}
