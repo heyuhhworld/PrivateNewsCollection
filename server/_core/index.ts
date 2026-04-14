@@ -10,6 +10,7 @@ import { registerNewsUploadRoutes } from "./newsUpload";
 import { registerReadingImageUploadRoutes } from "./readingImageUpload";
 import { registerChatStreamRoute } from "./chatStreamRoute";
 import { registerChromeExtensionDownload } from "./chromeExtensionDownload";
+import { registerDevVerifyRoute } from "./devVerifyRoute";
 import { registerLanHintRoute } from "./lanHintRoute";
 import { startScheduler } from "./scheduler";
 import { appRouter } from "../routers";
@@ -31,6 +32,7 @@ async function startServer() {
   });
 
   registerChromeExtensionDownload(app);
+  registerDevVerifyRoute(app);
   registerLanHintRoute(app);
 
   // OAuth callback under /api/oauth/callback

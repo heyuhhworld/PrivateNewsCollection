@@ -15,5 +15,5 @@ export function getRehypePluginsWithOrigin() {
     }
     return val;
   });
-  return plugins;
+  return plugins as any;
 }

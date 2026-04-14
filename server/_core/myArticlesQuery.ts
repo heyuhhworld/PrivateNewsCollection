@@ -105,7 +105,7 @@ export async function maybeBuildMyArticlesAnswer(
   if (strategyDist.size > 1) {
     lines.push("### 策略分布");
     lines.push("");
-    for (const [s, c] of [...strategyDist.entries()].sort((a, b) => b[1] - a[1])) {
+    for (const [s, c] of Array.from(strategyDist.entries()).sort((a, b) => b[1] - a[1])) {
       lines.push(`- ${s}：${c} 篇`);
     }
     lines.push("");

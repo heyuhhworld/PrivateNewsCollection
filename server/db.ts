@@ -558,7 +558,7 @@ export async function listRecentNewsArticlesSince(
     gte(newsArticles.createdAt, since),
   ];
   if (strategy) {
-    conditions.push(eq(newsArticles.strategy, strategy));
+    conditions.push(eq(newsArticles.strategy, strategy as any));
   }
   return db
     .select()

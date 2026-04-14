@@ -73,7 +73,7 @@ function BriefingMarkdownBody({
     [navigate, citationTitleMap]
   );
   return (
-    <Streamdown className="streamdown-briefing" components={{ a: A }} rehypePlugins={getRehypePluginsWithOrigin()}>
+    <Streamdown className="streamdown-briefing" components={{ a: A } as any} rehypePlugins={getRehypePluginsWithOrigin()}>
       {markdown}
     </Streamdown>
   );

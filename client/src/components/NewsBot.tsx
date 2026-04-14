@@ -478,8 +478,6 @@ export default function NewsBot({
             id: nanoid(),
           },
         ]);
-        setAwaitingBriefingCustomizeConfirm(false);
-        setAwaitingBriefingPromptInput(false);
         return;
       }
 
@@ -521,8 +519,6 @@ export default function NewsBot({
             id: nanoid(),
           },
         ]);
-        setAwaitingBriefingCustomizeConfirm(false);
-        setAwaitingBriefingPromptInput(false);
         return;
       }
 
