@@ -1164,16 +1164,17 @@ export default function NewsBot({
       </div>
 
       <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
-        <DialogContent className="max-w-2xl gap-0 p-0 overflow-hidden">
+        <DialogContent className="max-w-2xl min-w-0 gap-0 p-0 overflow-hidden">
           <DialogHeader className="px-5 py-4 border-b border-gray-100">
             <DialogTitle className="text-base text-gray-900">历史会话</DialogTitle>
           </DialogHeader>
-          <ScrollArea className="max-h-[60vh]">
-            <div className="p-3 space-y-2">
+          {/* 不用 Radix ScrollArea：其 viewport 内层为 display:table，会把横向 flex 撑出视口导致右侧按钮被裁切 */}
+          <div className="max-h-[60vh] min-h-0 overflow-y-auto overflow-x-hidden px-3 py-3 [scrollbar-gutter:stable]">
+            <div className="space-y-2">
               {(sessionList ?? []).map((s) => (
                 <div
                   key={s.sessionId}
-                  className={`rounded-lg border px-3 py-2 ${
+                  className={`min-w-0 rounded-lg border px-3 py-2 ${
                     s.sessionId === sessionId ? "border-[#1677ff]/40 bg-blue-50/50" : "border-gray-200 bg-white"
                   }`}
                 >
@@ -1213,10 +1214,10 @@ export default function NewsBot({
                       </Button>
                     </div>
                   ) : (
-                    <div className="flex items-start justify-between gap-2">
+                    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-2">
                       <button
                         type="button"
-                        className="min-w-0 flex-1 text-left"
+                        className="min-w-0 text-left"
                         onClick={() => {
                           setSessionId(s.sessionId);
                           setStoredSessionId(CHAT_SESSION_KEY, s.sessionId);
@@ -1229,7 +1230,7 @@ export default function NewsBot({
                           {new Date(s.lastAt).toLocaleString()} · {s.totalMessages} 条消息
                         </p>
                       </button>
-                      <div className="flex items-center gap-1">
+                      <div className="flex w-max shrink-0 items-center gap-1">
                         <button
                           type="button"
                           className="inline-flex h-7 w-7 items-center justify-center rounded border border-gray-200 text-gray-500 hover:text-[#1677ff]"
@@ -1261,7 +1262,7 @@ export default function NewsBot({
                 <div className="text-center text-sm text-gray-400 py-10">暂无历史会话</div>
               )}
             </div>
-          </ScrollArea>
+          </div>
         </DialogContent>
       </Dialog>
 
